@@ -1,0 +1,121 @@
+[
+  {
+    "index": 0,
+    "headers": [
+      "序号",
+      "灯丝电流 IfI_fIf​ (A)",
+      "灯丝温度 TTT (10310^{3}103 K)",
+      "绝对温度 TTT (K)",
+      "1/T1/T1/T (10−410^{-4}10−4 K−1^{-1}−1)",
+      "本次实验是否使用"
+    ],
+    "rowCount": 7,
+    "inputsPerRow": 6,
+    "firstRowInputs": [
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）"
+    ]
+  },
+  {
+    "index": 1,
+    "headers": [
+      "灯丝电流 IfI_fIf​ (A)",
+      "灯丝温度 TTT (K)",
+      "Ua=16U_a=16Ua​=16 V",
+      "Ua=25U_a=25Ua​=25 V",
+      "Ua=36U_a=36Ua​=36 V",
+      "Ua=49U_a=49Ua​=49 V",
+      "Ua=64U_a=64Ua​=64 V",
+      "Ua=81U_a=81Ua​=81 V",
+      "Ua=100U_a=100Ua​=100 V",
+      "Ua=121U_a=121Ua​=121 V",
+      "量程 / 备注"
+    ],
+    "rowCount": 6,
+    "inputsPerRow": 11,
+    "firstRowInputs": [
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）"
+    ]
+  },
+  {
+    "index": 2,
+    "headers": [
+      "Ua\\sqrt{U_a}Ua​​",
+      "UaU_aUa​ (V)",
+      "lg⁡Ia\\lg I_algIa​ (T=1800T=1800T=1800 K)",
+      "lg⁡Ia\\lg I_algIa​ (T=1880T=1880T=1880 K)",
+      "lg⁡Ia\\lg I_algIa​ (T=1960T=1960T=1960 K)",
+      "lg⁡Ia\\lg I_algIa​ (T=2040T=2040T=2040 K)",
+      "lg⁡Ia\\lg I_algIa​ (T=2120T=2120T=2120 K)"
+    ],
+    "rowCount": 9,
+    "inputsPerRow": 7,
+    "firstRowInputs": [
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）"
+    ]
+  },
+  {
+    "index": 3,
+    "headers": [
+      "序号",
+      "灯丝电流 IfI_fIf​ (A)",
+      "TTT (K)",
+      "1/T1/T1/T (10−410^{-4}10−4 K−1^{-1}−1)",
+      "lg⁡I0\\lg I_0lgI0​（截距）",
+      "I0I_0I0​ (μA)",
+      "I0/T2I_0/T^{2}I0​/T2",
+      "lg⁡(I0/T2)\\lg(I_0/T^{2})lg(I0​/T2)"
+    ],
+    "rowCount": 5,
+    "inputsPerRow": 8,
+    "firstRowInputs": [
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）"
+    ]
+  },
+  {
+    "index": 4,
+    "headers": [
+      "项目",
+      "符号",
+      "数值",
+      "单位",
+      "说明"
+    ],
+    "rowCount": 8,
+    "inputsPerRow": 5,
+    "firstRowInputs": [
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）",
+      "输入数据（支持 $\\LaTeX$ 公式）"
+    ]
+  }
+]

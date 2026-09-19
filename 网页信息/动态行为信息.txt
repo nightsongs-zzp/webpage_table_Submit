@@ -1,0 +1,7 @@
+new MutationObserver(() => {
+  console.log('表格变化，当前输入框数:',
+    document.querySelectorAll('#fillableDataTableEditor input').length);
+}).observe(document.getElementById('fillableDataTableEditor'), 
+  { childList: true, subtree: true });
+undefined
+VM449:2 表格变化，当前输入框数: 341

@@ -1,0 +1,2757 @@
+tailwind.config = {
+  theme: {
+    extend: {
+      colors: {
+        primary: '#165DFF',
+        secondary: '#0E2B5C'
+      }
+    }
+  }
+};
+
+let currentExp = null;
+let currentUser = null;
+let isLogin = false;
+let teacherLoggedIn = false;
+
+// 璁板綍杩涘叆椤甸潰鐨勬椂闂存埑锛堢敤浜庤绠楀涔犳椂闀匡級
+let studyStartTime = Date.now();
+
+function getUrlParam(name) {
+  const reg = new RegExp('(^|&)' + name + '=([^&]*)(&|$)');
+  const r = window.location.search.substr(1).match(reg);
+  return r ? unescape(r[2]) : null;
+}
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function parseMarkdownWithMath(raw) {
+  if (!raw) return '';
+  let text = String(raw).replace(/\r\n/g, '\n');
+  const mathBlocks = [];
+  text = text.replace(/\\\$/g, '__ESCAPED_DOLLAR__');
+
+  // 浣跨敤 HTML 鍗犱綅绗︼紝閬垮厤琚?Markdown 瑙ｆ瀽涓哄己璋冪瓑璇硶
+  text = text.replace(/\$\$([\s\S]+?)\$\$/g, (match, formula) => {
+    const key = `MATH_BLOCK_${mathBlocks.length}`;
+    mathBlocks.push({ key, formula, displayMode: true });
+    return `<span data-math-placeholder="${key}"></span>`;
+  });
+  text = text.replace(/\$([^\$\n]+?)\$/g, (match, formula) => {
+    const key = `MATH_INLINE_${mathBlocks.length}`;
+    mathBlocks.push({ key, formula, displayMode: false });
+    return `<span data-math-placeholder="${key}"></span>`;
+  });
+
+  let html = marked.parse(text || '', { gfm: true, breaks: true });
+
+  // 鐢?KaTeX renderToString 鏇挎崲鍗犱綅绗︿负鏈€缁?HTML
+  mathBlocks.forEach(item => {
+    const placeholder = `<span data-math-placeholder="${item.key}"></span>`;
+    const formula = (item.formula || '').trim();
+    try {
+      const katexHtml = (window.katex && typeof window.katex.renderToString === 'function')
+        ? katex.renderToString(formula, { throwOnError: false, displayMode: item.displayMode })
+        : escapeHtml(formula);
+      html = html.replace(placeholder, katexHtml);
+    } catch (e) {
+      html = html.replace(placeholder, escapeHtml(formula));
+    }
+  });
+
+  html = html.replace(/__ESCAPED_DOLLAR__/g, '$');
+  return html;
+}
+
+// 基础信息栏（核心知识点 / 前置知识要求）等“短文本”字段：支持 Markdown 与 $LaTeX$
+function renderInlineMarkdown(raw) {
+  if (!raw || !String(raw).trim()) return '';
+  const html = parseMarkdownWithMath(raw);
+  // 单段落时剥掉 marked 生成的 <p> 外层，避免表格单元格里出现多余的行距
+  const only = html.trim().match(/^<p>([\s\S]*)<\/p>$/);
+  return only ? only[1] : html;
+}
+
+function renderMathInElement(container) {
+  if (!container || !window.katex || typeof window.katex.render !== 'function') return;
+  container.querySelectorAll('.katex-math').forEach(el => {
+    const formula = el.getAttribute('data-math') || '';
+    const displayMode = el.getAttribute('data-display') === 'true';
+    try {
+      katex.render(formula, el, {
+        throwOnError: false,
+        displayMode: displayMode,
+        errorColor: '#cc0000'
+      });
+    } catch (e) {
+      el.textContent = formula;
+    }
+  });
+}
+
+// 简单的 LaTeX 公式渲染函数（仅渲染 $...$ 和 $$...$$，不处理 Markdown）
+// 注意：换行转 <br> 必须在 KaTeX 渲染「之前」完成。KaTeX 输出 \sqrt 等拉伸符号时，
+// 其 <svg><path d="..."> 的属性字符串中含换行符，若渲染后再做 \n→<br> 替换，会把
+// <br> 塞进 path 的 d 属性，导致根号等符号无法绘制（控制台报 "Expected path command"）。
+// 因此这里先把公式抽成占位符，处理完换行后再回填 KaTeX HTML。
+function renderLatex(text) {
+  try {
+    if (!text || typeof text !== 'string' || !text.trim()) return '';
+    // 先转义 HTML
+    const d = document.createElement('div');
+    d.textContent = text;
+    let html = d.innerHTML;
+
+    const store = [];
+    const stash = (eq, display) => {
+      let out;
+      if (window.katex && typeof katex.renderToString === 'function') {
+        try {
+          out = katex.renderToString(eq.trim(), { displayMode: display, throwOnError: false });
+        } catch (e) {
+          out = '<span style="color:#ef4444;">[公式错误]</span>';
+        }
+      } else {
+        out = escapeHtml((display ? '$$' : '$') + eq + (display ? '$$' : '$'));
+      }
+      store.push(out);
+      return '\uE000' + (store.length - 1) + '\uE001';
+    };
+
+    // 先处理行间公式 $$...$$
+    html = html.replace(/\$\$([\s\S]*?)\$\$/g, (m, eq) => stash(eq, true));
+    // 再处理行内公式 $...$
+    html = html.replace(/\$([\s\S]*?)\$/g, (m, eq) => stash(eq, false));
+    // 此时 html 中只剩普通文本，可安全地把换行变成 <br>
+    html = html.replace(/\n/g, '<br>');
+    // 回填 KaTeX HTML
+    html = html.replace(/\uE000(\d+)\uE001/g, (m, i) => store[+i] || '');
+    return html;
+  } catch(e) {
+    console.warn('renderLatex error:', e);
+    // 保底：返回 HTML 转义后的原文
+    const d = document.createElement('div');
+    d.textContent = String(text);
+    return d.innerHTML.replace(/\n/g, '<br>');
+  }
+}
+
+// 富文本渲染（Markdown + LaTeX 公式），用于自测题的答案/解析等短内容：
+// 公式先用私有字符占位符保护（避免被 marked 当成强调/转义误伤，且保留原始字符供 KaTeX 渲染），
+// 剩余文本做 HTML 转义后走 marked（**加粗**、*斜体*、- 列表、`代码`、表格等），最后还原公式为 KaTeX HTML。
+function renderQuizRichText(raw) {
+  if (!raw) return '';
+  let t = String(raw).replace(/\r\n/g, '\n').replace(/\\\$/g, '__ESCAPED_DOLLAR__');
+  const blocks = [];
+  // 行间公式 $$...$$
+  t = t.replace(/\$\$([\s\S]+?)\$\$/g, (m, eq) => {
+    const tok = '\uE000' + blocks.length + '\uE001';
+    blocks.push({ tok, eq: eq.trim(), display: true });
+    return tok;
+  });
+  // 行内公式 $...$
+  t = t.replace(/\$([^\$\n]+?)\$/g, (m, eq) => {
+    const tok = '\uE000' + blocks.length + '\uE001';
+    blocks.push({ tok, eq: eq.trim(), display: false });
+    return tok;
+  });
+  // 剩余文本做 HTML 转义防注入（公式已被私有字符占位符保护，不受影响）
+  const esc = document.createElement('div');
+  esc.textContent = t;
+  let html = esc.innerHTML;
+  if (window.marked && typeof marked.parse === 'function') {
+    html = marked.parse(html, { gfm: true, breaks: true });
+  } else {
+    // marked CDN 未加载：降级为纯文本 + 换行
+    html = html.replace(/\n/g, '<br>');
+  }
+  blocks.forEach(b => {
+    let kh = '';
+    try {
+      kh = (window.katex && typeof katex.renderToString === 'function')
+        ? katex.renderToString(b.eq, { throwOnError: false, displayMode: b.display })
+        : escapeHtml((b.display ? '$$' : '$') + b.eq + (b.display ? '$$' : '$'));
+    } catch (e) {
+      kh = '<span style="color:#ef4444;">[公式错误]</span>';
+    }
+    html = html.split(b.tok).join(kh);
+  });
+  html = html.replace(/__ESCAPED_DOLLAR__/g, '$');
+  return html;
+}
+
+function renderExpContent(exp) {
+  currentExp = exp;
+  document.getElementById('expNameCatalog').innerText = exp.name || '';
+  document.getElementById('expNameBread').innerText = exp.name || '';
+  document.getElementById('expTitle').innerText = exp.name || '加载失败';
+  document.getElementById('expDifficulty').innerText = `难度：${exp.difficulty || '★★★'}`;
+  document.getElementById('expPeriod').innerText = `建议学时：${exp.period || '4学时'}`;
+  document.getElementById('expType').innerText = `所属分类：${exp.category_name || '未分类'}`;
+  document.getElementById('baseName').innerText = exp.name || '-';
+  document.getElementById('baseCategory').innerText = exp.category_name || '-';
+  document.getElementById('baseDifficulty').innerText = exp.difficulty || '-';
+  document.getElementById('basePeriod').innerText = exp.period || '-';
+  document.getElementById('baseKnowledge').innerHTML = renderInlineMarkdown(exp.core_knowledge) || '-';
+  document.getElementById('basePreKnowledge').innerHTML = renderInlineMarkdown(exp.pre_knowledge) || '-';
+
+  const renderModule = (id, content) => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.innerHTML = content ? parseMarkdownWithMath(content) : '<span class="text-gray-500">【暂无内容】</span>';
+      renderMathInElement(el);
+    }
+  };
+  renderModule('targetContent', exp.target_content);
+  renderModule('principleContent', exp.principle_content);
+  renderModule('previewQuestionContent', exp.preview_question);
+  renderModule('equipmentContent', exp.equipment_table);
+  renderModule('safetyContent', exp.safety_content);
+  renderModule('operationFlowContent', exp.operation_flow);
+  renderModule('operationTipsContent', exp.operation_tips);
+  renderModule('dataRecordContent', exp.data_table);
+  renderModule('dataCalcContent', exp.data_calc);
+  renderModule('errorAnalysisContent', exp.error_analysis);
+  renderModule('resultRequireContent', exp.result_require);
+  renderModule('afterQuestionContent', exp.after_question);
+  renderModule('expandAppContent', exp.expand_content);
+  renderModule('testBankContent', exp.test_bank);
+
+  // 将普通网页链接转换为可嵌入的播放器地址（B站 / YouTube 等），无法识别的原样返回
+  const toEmbedUrl = (url) => {
+    const bili = url.match(/bilibili\.com\/video\/(BV[0-9A-Za-z]+)/i);
+    if (bili) return `//player.bilibili.com/player.html?bvid=${bili[1]}&autoplay=0&danmaku=1`;
+    const yt = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([0-9A-Za-z_-]{11})/i);
+    if (yt) return `https://www.youtube.com/embed/${yt[1]}`;
+    return url;
+  };
+
+  // 提取 B站视频 BV 号（兼容 bvid= 参数与 /video/BVxxx 链接）
+  const extractBvid = (url) => {
+    const s = String(url || '');
+    const m = s.match(/bvid=(BV[0-9A-Za-z]+)/i) || s.match(/bilibili\.com\/video\/(BV[0-9A-Za-z]+)/i);
+    return m ? m[1] : '';
+  };
+
+  // 异步加载 B站视频标题与封面并显示在播放卡片上（失败时静默保留占位样式）
+  const loadVideoMeta = (container) => {
+    if (!container) return;
+    container.querySelectorAll('.video-play-card[data-video-bvid]').forEach((card) => {
+      const bvid = card.dataset.videoBvid;
+      fetch(`/api/bili-info?bvid=${encodeURIComponent(bvid)}`, { credentials: 'include' })
+        .then((r) => r.json())
+        .then((res) => {
+          if (!(res && res.code === 1 && res.data)) return;
+          const info = res.data;
+          // 标题：显示在卡片下方的视频名称
+          if (info.title) {
+            const title = String(info.title).trim();
+            if (title) {
+              card.dataset.videoTitle = title;
+              const nameEl = card.parentElement && card.parentElement.querySelector('.video-play-name');
+              if (nameEl) {
+                nameEl.textContent = title;
+                nameEl.title = title;
+              }
+            }
+          }
+          // 封面：铺在卡片底层（B站图片防盗链，须去掉 Referer 头）
+          if (info.pic) {
+            const pic = String(info.pic).trim();
+            if (pic) {
+              const img = document.createElement('img');
+              img.className = 'video-play-cover';
+              img.src = pic;
+              img.alt = '';
+              img.referrerPolicy = 'no-referrer';
+              img.onerror = function() { if (img.parentNode) img.parentNode.removeChild(img); };
+              card.insertBefore(img, card.firstChild);
+              card.classList.add('has-cover');
+            }
+          }
+        })
+        .catch(() => {});
+    });
+  };
+
+  // 视频统一渲染为“播放卡片”：点击后在弹窗中播放，不跳转、不自动播放
+  const getVideoHtml = (videoUrl) => {
+    const raw = String(videoUrl || '').trim();
+    if (!raw) return '';
+    // 解析出真实视频地址与类型：kind = 'iframe'（站外播放器）| 'file'（本地视频文件）
+    let src = '';
+    let kind = 'iframe';
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(raw, 'text/html');
+    const iframe = doc.querySelector('iframe');
+    if (iframe) {
+      const s = iframe.getAttribute('src')?.trim();
+      if (!s || !/^(https?:\/\/|\/\/|\/)/i.test(s) || /^javascript:/i.test(s)) return '';
+      src = s;
+      kind = 'iframe';
+    } else {
+      const match = raw.match(/^(?:src=)?["']?(.+?)["']?$/i);
+      let url = match ? match[1].trim() : raw;
+    // 鏀寔 uploads/xxx锛堜笉甯﹀墠瀵兼枩鏉狅級鐨勬儏鍐?
+      if (!/^(https?:\/\/|\/\/|\/)/i.test(url)) {
+        if (/^uploads\//i.test(url)) url = '/' + url;
+        else return '';
+      }
+      if (/^javascript:/i.test(url)) return '';
+      if (/\.(mp4|webm|ogg|mov|m4v)(\?.*)?$/i.test(url)) {
+        src = url;
+        kind = 'file';
+      } else {
+        // 普通网页链接 → 转为可嵌入播放器地址，避免被网站拦截导致整页跳转
+        src = toEmbedUrl(url);
+        kind = 'iframe';
+      }
+    }
+    if (!src) return '';
+    const escapedSrc = escapeHtml(src);
+    const bvid = extractBvid(src);
+    const bvidAttr = bvid ? ` data-video-bvid="${bvid}"` : '';
+    return `<div class="video-play-wrap">
+      <div class="video-play-card" data-video-src="${escapedSrc}" data-video-kind="${kind}"${bvidAttr} title="点击播放视频">
+        <div class="video-play-btn"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></div>
+      </div>
+      <div class="video-play-name">点击播放视频</div>
+    </div>`;
+  };
+  const getImageHtml = (imageUrl) => {
+    const raw = String(imageUrl || '').trim();
+    if (!raw) return '';
+    // 支持逗号分隔的多张图片
+    const urls = raw.split(',').map(s => s.trim()).filter(Boolean);
+    if (urls.length === 0) return '';
+    if (urls.length === 1) {
+      let finalUrl = urls[0];
+      if (!/^(https?:\/\/|\/\/|\/)/i.test(finalUrl)) {
+        if (/^uploads\//i.test(finalUrl)) finalUrl = '/' + finalUrl;
+        else return '';
+      }
+      if (/^javascript:/i.test(finalUrl)) return '';
+      const escapedUrl = escapeHtml(finalUrl);
+      const encodedUrl = encodeURIComponent(finalUrl);
+      return `<img src="${escapedUrl}" alt="嵌入图片" class="media-zoomable" style="max-width:100%; max-height:100%; object-fit:contain; display:block; cursor:zoom-in;" onclick="event.stopPropagation(); openMediaModal('${encodedUrl}', 'image')">`;
+    }
+    // 多张图片 → 渲染内联轮播
+    const id = 'stu-carousel-' + Math.random().toString(36).substr(2, 6);
+    const items = urls.map((url, idx) => {
+      let finalUrl = url;
+      if (!/^(https?:\/\/|\/\/|\/)/i.test(finalUrl)) {
+        if (/^uploads\//i.test(finalUrl)) finalUrl = '/' + finalUrl;
+        else finalUrl = '';
+      }
+      if (!finalUrl || /^javascript:/i.test(finalUrl)) return '';
+      const encoded = encodeURIComponent(finalUrl);
+      return `<div class="carousel-item${idx === 0 ? ' active' : ''}" data-index="${idx}">
+        <img src="${escapeHtml(finalUrl)}" alt="图片 ${idx+1}" class="media-zoomable" style="max-width:100%; max-height:100%; object-fit:contain; display:block; margin:0 auto; cursor:zoom-in;" onclick="event.stopPropagation(); openMediaModal('${encoded}', 'image')">
+      </div>`;
+    }).filter(Boolean).join('');
+    const prevBtn = urls.length > 1 ? `<button type="button" class="carousel-btn carousel-prev" onclick="stuCarouselSlide('${id}', -1)">&lsaquo;</button>` : '';
+    const nextBtn = urls.length > 1 ? `<button type="button" class="carousel-btn carousel-next" onclick="stuCarouselSlide('${id}', 1)">&rsaquo;</button>` : '';
+    const dots = urls.length > 1 ? `<div class="carousel-dots">${urls.map((_, i) => `<span class="carousel-dot${i === 0 ? ' active' : ''}" onclick="stuCarouselGo('${id}', ${i})"></span>`).join('')}</div>` : '';
+    return `<div class="carousel-container" id="${id}" style="width:100%;height:100%;min-height:160px;position:relative;">
+      <div class="carousel-wrapper" style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;">${items}</div>
+      ${prevBtn}${nextBtn}${dots}
+    </div>`;
+  };
+  const renderMediaPair = (videoId, imageId, videoUrl, imageUrl) => {
+    const videoEl = document.getElementById(videoId);
+    const imageEl = document.getElementById(imageId);
+    const hasVideo = Boolean(videoUrl && String(videoUrl).trim());
+    const hasImage = Boolean(imageUrl && String(imageUrl).trim());
+    if (!videoEl || !imageEl) return;
+
+    if (hasVideo) {
+      const html = getVideoHtml(videoUrl);
+      videoEl.innerHTML = html || '<span class="text-gray-500">No video</span>';
+      videoEl.style.display = '';
+      loadVideoMeta(videoEl); // 异步加载 B站视频标题与封面
+    } else {
+      videoEl.style.display = 'none';
+    }
+
+    if (hasImage) {
+      const html = getImageHtml(imageUrl);
+      imageEl.innerHTML = html || '<span class="text-gray-500">No image</span>';
+      imageEl.style.display = '';
+    } else {
+      imageEl.style.display = 'none';
+    }
+  };
+  renderMediaPair('videoPrinciple', 'imagePrinciple', exp.videoPrinciple, exp.imagePrinciple);
+  renderMediaPair('videoSafety', 'imageSafety', exp.videoSafety, exp.imageSafety);
+  renderMediaPair('videoOperation', 'imageOperation', exp.videoOperation, exp.imageOperation);
+  renderMediaPair('videoDataRecord', 'imageDataRecord', exp.videoDataRecord || exp.videoDataRecordContent, exp.imageDataRecord);
+  renderMediaPair('videoDataCalc', 'imageDataCalc', exp.videoDataCalc || exp.videoDataCalcContent, exp.imageDataCalc);
+  renderMediaPair('videoError', 'imageError', exp.videoError, exp.imageError);
+  renderMediaPair('videoResult', 'imageResult', exp.videoResult, exp.imageResult);
+  renderMediaPair('videoTarget', 'imageTarget', exp.videoTarget, exp.imageTarget);
+  renderMediaPair('videoPreviewQuestion', 'imagePreviewQuestion', exp.videoPreviewQuestion, exp.imagePreviewQuestion);
+  renderMediaPair('videoEquipment', 'imageEquipment', exp.videoEquipment, exp.imageEquipment);
+  renderMediaPair('videoOperationTips', 'imageOperationTips', exp.videoOperationTips, exp.imageOperationTips);
+  renderMediaPair('videoExpand', 'imageExpand', exp.videoExpand, exp.imageExpand);
+
+  // 基础信息区的实验概览图（= 教师端「1. 实验基础信息 → 编辑封面图」里的图，多张时轮播）。
+  // ⚠️ 学生端实验列表卡片的封面用的也是这里的**第一张**，两处同源，不要只改一边。
+  const overviewImgEl = document.getElementById('imageOverview');
+  if (overviewImgEl) {
+    const overviewHtml = getImageHtml(exp.imageOverview);
+    if (overviewHtml) {
+      overviewImgEl.innerHTML = overviewHtml;
+      overviewImgEl.style.display = '';
+    } else {
+      overviewImgEl.innerHTML = '';
+      overviewImgEl.style.display = 'none';
+    }
+  }
+
+  // 虚拟实验按钮
+  const virtualContainer = document.getElementById('virtualLabContainer');
+  const virtualLink = document.getElementById('virtualLabLink');
+  if (virtualContainer && virtualLink) {
+    const url = exp.virtualLabUrl || '';
+    if (url.trim()) {
+      virtualLink.href = url.trim();
+      virtualContainer.classList.remove('hidden');
+    } else {
+      virtualContainer.classList.add('hidden');
+    }
+  }
+}
+
+document.querySelectorAll('.catalog-item').forEach(item => {
+  item.addEventListener('click', () => {
+    const targetId = item.getAttribute('data-target');
+    const targetEl = document.getElementById(targetId);
+    if (targetEl) window.scrollTo({ top: targetEl.offsetTop - 80, behavior: 'smooth' });
+    // 移动端抽屉：点目录项后自动收起
+    if (window.matchMedia('(max-width: 1023.98px)').matches) {
+      document.getElementById('catalog-sidebar-wrapper')?.classList.remove('mobile-open');
+    }
+  });
+});
+
+let isScrolling = false;
+
+window.addEventListener('scroll', () => {
+  if (!isScrolling) {
+    window.requestAnimationFrame(() => {
+      let currentSection = '';
+      const offset = 100;
+
+      const sections = document.querySelectorAll('[id^="section-"]');
+      sections.forEach(section => {
+        if (window.scrollY >= section.offsetTop - offset) {
+          currentSection = section.id;
+        }
+      });
+
+      const catalogItems = document.querySelectorAll('.catalog-item');
+      catalogItems.forEach(item => {
+        const targetId = item.getAttribute('data-target');
+        const isActive = targetId === currentSection;
+        
+        item.classList.toggle('nav-active', isActive);
+        
+        if (isActive) {
+          item.classList.add('bg-primary/10', 'text-primary', 'font-bold', 'border-l-2', 'border-primary');
+        } else {
+          item.classList.remove('bg-primary/10', 'text-primary', 'font-bold', 'border-l-2', 'border-primary');
+        }
+      });
+
+      isScrolling = false;
+    });
+    isScrolling = true;
+  }
+});
+
+const backToTopBtn = document.getElementById('backToTop');
+backToTopBtn?.addEventListener('click', () => {
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+});
+
+const sidebarWrapper = document.getElementById('catalog-sidebar-wrapper');
+const sidebar = document.getElementById('catalog-sidebar');
+const sidebarResizeHandle = document.getElementById('sidebarResizeHandle');
+const sidebarToggleBtn = document.getElementById('toggleSidebarBtn');
+const sidebarToggleBtnFixed = document.getElementById('sidebarToggleBtnFixed');
+let sidebarOpen = localStorage.getItem('sidebarOpen');
+let sidebarWidth = localStorage.getItem('sidebarWidth') || '260px';
+
+function updateSidebarDisplay() {
+  if (!sidebarWrapper || !sidebar || !sidebarResizeHandle || !sidebarToggleBtn || !sidebarToggleBtnFixed) return;
+  if (sidebarOpen === null || sidebarOpen === undefined) sidebarOpen = 'true';
+  const isOpen = sidebarOpen === 'true';
+  if (isOpen) {
+    sidebarWrapper.classList.remove('sidebar-collapsed');
+    sidebar.style.width = sidebarWidth;
+    sidebarWrapper.style.width = sidebarWidth;
+    sidebarResizeHandle.style.display = 'block';
+    sidebarToggleBtn.classList.remove('hidden');
+    sidebarToggleBtnFixed.classList.remove('show');
+    sidebarToggleBtn.innerHTML = `<i class="fa-solid fa-angle-left"></i> 关闭`;
+  } else {
+    sidebarWrapper.classList.add('sidebar-collapsed');
+    sidebarWrapper.style.width = '0px';
+    sidebar.style.width = '0px';
+    sidebarResizeHandle.style.display = 'none';
+    sidebarToggleBtn.classList.add('hidden');
+    sidebarToggleBtnFixed.classList.add('show');
+    sidebarToggleBtnFixed.innerHTML = `打开目录 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="inline-block w-4 h-4 ml-1 align-middle"><path stroke-linecap="round" stroke-linejoin="round" d="M9.568 3H5.25A2.25 2.25 0 0 0 3 5.25v4.318c0 .597.237 1.17.659 1.591l9.581 9.581c.699.699 1.78.872 2.607.33a18.095 18.095 0 0 0 5.223-5.223c.542-.827.369-1.908-.33-2.607L11.16 3.66A2.25 2.25 0 0 0 9.568 3Z" /><path stroke-linecap="round" stroke-linejoin="round" d="M6 6h.008v.008H6V6Z" /></svg>`;
+  }
+  localStorage.setItem('sidebarOpen', sidebarOpen);
+}
+
+function setSidebarWidth(width) {
+  sidebarWidth = width;
+  if (!sidebarWrapper || !sidebar) return;
+  sidebar.style.width = width;
+  sidebarWrapper.style.width = width;
+  localStorage.setItem('sidebarWidth', width);
+}
+
+function initSidebarResize() {
+  if (!sidebarResizeHandle || !sidebar) return;
+  sidebarResizeHandle.style.display = 'block';
+  sidebarResizeHandle.addEventListener('mousedown', (event) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = sidebar.getBoundingClientRect().width;
+    document.body.style.cursor = 'col-resize';
+
+    const onMouseMove = (moveEvent) => {
+      const newWidth = Math.min(420, Math.max(260, startWidth + moveEvent.clientX - startX));
+      setSidebarWidth(`${newWidth}px`);
+    };
+
+    const onMouseUp = () => {
+      document.body.style.cursor = '';
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  });
+}
+
+sidebarToggleBtn?.addEventListener('click', () => {
+  // 移动端（<lg）抽屉：点「关闭」收起覆盖层
+  if (window.matchMedia('(max-width: 1023.98px)').matches && sidebarWrapper) {
+    sidebarWrapper.classList.remove('mobile-open');
+    return;
+  }
+  sidebarOpen = sidebarOpen === 'true' ? 'false' : 'true';
+  sidebarResizeHandle.style.display = 'block';
+  updateSidebarDisplay();
+});
+
+sidebarToggleBtnFixed?.addEventListener('click', () => {
+  // 移动端（<lg）抽屉：点「打开目录」弹出覆盖层
+  if (window.matchMedia('(max-width: 1023.98px)').matches && sidebarWrapper) {
+    sidebarWrapper.classList.add('mobile-open');
+    return;
+  }
+  sidebarOpen = 'true';
+  sidebarResizeHandle.style.display = 'block';
+  updateSidebarDisplay();
+});
+
+updateSidebarDisplay();
+initSidebarResize();
+
+// 跨断点时（平板旋转/窗口拉宽到 lg）清掉移动端抽屉态，避免侧边栏以覆盖层残留在桌面
+window.addEventListener('resize', () => {
+  if (!window.matchMedia('(max-width: 1023.98px)').matches && sidebarWrapper) {
+    sidebarWrapper.classList.remove('mobile-open');
+  }
+});
+
+function reportStudentAction(actionName, status) {
+  if (!isLogin || !currentExp || !currentExp.name) return;
+  fetch('/api/student/report-action', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      project: currentExp.name,
+      action: actionName,
+      status: status
+    })
+  }).catch(e => console.error('行为上报失败:', e));
+}
+
+async function checkLogin() {
+  try {
+    const res = await fetch('/api/student/info', { credentials: 'include' });
+    const data = await res.json();
+    if (data.code === 1) {
+      isLogin = true;
+      currentUser = data.data;
+      return true;
+    }
+  } catch (e) {}
+  isLogin = false;
+  currentUser = null;
+  return false;
+}
+
+/** 检查任意角色登录（学生或教师），兼容教师访问学生页面的场景 */
+async function checkAnyLogin() {
+  // 先快速检查缓存
+  if (isLogin) return true;
+  if (teacherLoggedIn) return true;
+  try {
+    const res = await fetch('/api/auth/me', { credentials: 'include' });
+    const data = await res.json();
+    if (data.code === 1 && data.data) {
+      if (data.data.role === 'teacher') {
+        teacherLoggedIn = true;
+        currentUser = data.data;
+      } else {
+        isLogin = true;
+        currentUser = data.data;
+      }
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
+
+async function toggleFavorite() {
+  if (!(await checkLogin())) {
+    alert('请先登录');
+    location.href = '/public/user.html';
+    return;
+  }
+  try {
+    await fetch('/api/student/addFavorite', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({
+        experimentName: currentExp.name,
+        experimentType: currentExp.category_name,
+        experimentId: currentExp.id   // 供个人中心「我的收藏」点击跳转到本实验
+      })
+    });
+    alert('收藏成功');
+    reportStudentAction('收藏实验', '已完成');
+  } catch (e) {
+    alert('收藏失败');
+  }
+}
+
+async function addStudyRecord() {
+  if (!(await checkLogin())) return;
+  try {
+    await fetch('/api/student/addStudy', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ experimentName: currentExp.name })
+    });
+  } catch (e) {}
+}
+
+async function postComment() {
+  if (!currentExp) {
+    alert('实验信息未加载');
+    return;
+  }
+  if (!(await checkLogin())) {
+    alert('请先登录');
+    location.href = '/public/user.html';
+    return;
+  }
+  const content = document.getElementById('commentContent').value.trim();
+  if (!content) {
+    alert('请输入评论内容');
+    return;
+  }
+  if (content.length > 500) {
+    alert('评论不能超过500字');
+    return;
+  }
+  try {
+    const res = await fetch('/api/comment/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ expId: currentExp.id, content: content })
+    });
+    const data = await res.json();
+    if (data.code === 1) {
+      alert('发布成功');
+      document.getElementById('commentContent').value = '';
+      loadComments();
+      reportStudentAction('发表评论', '已完成');
+    } else {
+      alert('发布失败：' + data.msg);
+    }
+  } catch (e) {
+    alert('发布失败');
+  }
+}
+
+async function likeComment(commentId) {
+  if (!(await checkAnyLogin())) {
+    alert('请先登录');
+    return;
+  }
+  try {
+    const res = await fetch('/api/comment/like', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ id: commentId })
+    });
+    const data = await res.json();
+    if (data.code === 1) {
+      loadComments();
+    } else {
+      alert(data.msg || '点赞失败');
+    }
+  } catch (e) {
+    alert('点赞失败，请检查网络');
+  }
+}
+
+async function deleteComment(commentId) {
+  if (!confirm('确定删除这条评论吗？')) return;
+  try {
+    const res = await fetch('/api/comment/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ id: commentId })
+    });
+    const data = await res.json();
+    if (data.code === 1) {
+      alert('删除成功');
+      loadComments();
+    } else {
+      alert('删除失败：' + data.msg);
+    }
+  } catch (e) {
+    alert('删除失败');
+  }
+}
+
+function toggleReplyForm(commentId) {
+  const el = document.getElementById(`replyForm-${commentId}`);
+  if (el) el.classList.toggle('hidden');
+}
+
+async function postReply(commentId) {
+  if (!currentExp) {
+    alert('实验信息未加载');
+    return;
+  }
+  if (!(await checkAnyLogin())) {
+    alert('请先登录');
+    location.href = '/public/user.html';
+    return;
+  }
+  const textarea = document.getElementById(`replyContent-${commentId}`);
+  if (!textarea) return;
+  const content = textarea.value.trim();
+  if (!content) {
+    alert('请输入回复内容');
+    return;
+  }
+  if (content.length > 300) {
+    alert('回复不能超过300字');
+    return;
+  }
+  try {
+    const res = await fetch('/api/comment/reply/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ commentId, content })
+    });
+    const data = await res.json();
+    if (data.code === 1) {
+      alert('回复成功');
+      textarea.value = '';
+      loadComments();
+      reportStudentAction('回复评论', '已完成');
+    } else {
+      alert('回复失败：' + data.msg);
+    }
+  } catch (e) {
+    alert('回复失败，请检查网络');
+  }
+}
+
+async function deleteReply(replyId) {
+  if (!confirm('确定删除这条回复吗？')) return;
+  try {
+    const res = await fetch('/api/comment/reply/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ id: replyId })
+    });
+    const data = await res.json();
+    if (data.code === 1) {
+      alert('删除成功');
+      loadComments();
+    } else {
+      alert('删除失败：' + data.msg);
+    }
+  } catch (e) {
+    alert('删除失败');
+  }
+}
+
+async function loadComments() {
+  if (!currentExp?.id) {
+    document.getElementById('commentList').innerHTML = '<div class="text-gray-500 text-center py-6">实验信息异常</div>';
+    return;
+  }
+  await checkLogin();
+  try {
+    const res = await fetch(`/api/comment/list?expId=${currentExp.id}`);
+    const data = await res.json();
+    const list = data.data || [];
+    const commentList = document.getElementById('commentList');
+    if (!commentList) return;
+    let html = '';
+
+    if (list.length === 0) {
+      html = '<div class="text-center text-gray-500 py-6">暂无评论，请登录后在评论区发表你的看法。</div>';
+    } else {
+      list.forEach(c => {
+        const isOwner = currentUser?.username === c.username;
+        const repliesHtml = (c.replies || []).map(r => {
+          const isReplyOwner = currentUser?.username === r.username;
+          return `
+            <div class="border-l border-gray-200 pl-4 mt-3">
+              <div class="flex justify-between text-sm text-gray-600 mb-1">
+                <span>${escapeHtml(r.username)}</span>
+                <span>${escapeHtml(r.createTime || '')}</span>
+              </div>
+              <div class="text-gray-700 whitespace-pre-wrap">${escapeHtml(r.content)}</div>
+              <div class="mt-2 text-xs text-gray-500">
+                ${isReplyOwner ? `<button onclick="deleteReply(${r.id})" class="text-red-500 hover:text-red-600 transition-colors">删除回复</button>` : ''}
+              </div>
+            </div>`;
+        }).join('');
+
+        html += `
+          <div class="p-4 border rounded-lg">
+            <div class="flex justify-between mb-2">
+              <span class="font-medium">${escapeHtml(c.username)}</span>
+              <span class="text-xs text-gray-400">${escapeHtml(c.createTime || '')}</span>
+            </div>
+            <div class="text-gray-700 whitespace-pre-wrap mb-3">${escapeHtml(c.content)}</div>
+            <div class="flex flex-wrap items-center gap-3 text-xs text-gray-500">
+              <button onclick="likeComment(${c.id})" class="flex items-center gap-1 hover:text-primary transition-colors">
+                <i class="fa-solid fa-thumbs-up"></i> ${c.likeCount || 0}
+              </button>
+              <button onclick="toggleReplyForm(${c.id})" class="inline-flex items-center gap-1 hover:text-primary transition-colors"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="M20.25 8.511c.884.284 1.5 1.128 1.5 2.097v4.286c0 1.136-.847 2.1-1.98 2.193-.34.027-.68.052-1.02.072v3.091l-3-3c-1.354 0-2.694-.055-4.02-.163a2.115 2.115 0 0 1-.825-.242m9.345-8.334a2.126 2.126 0 0 0-.476-.095 48.64 48.64 0 0 0-8.048 0c-1.131.094-1.976 1.057-1.976 2.192v4.286c0 .837.46 1.58 1.155 1.951m9.345-8.334V6.637c0-1.621-1.152-3.026-2.76-3.235A48.455 48.455 0 0 0 11.25 3c-2.115 0-4.198.137-6.24.402-1.608.209-2.76 1.614-2.76 3.235v6.226c0 1.621 1.152 3.026 2.76 3.235.577.075 1.157.14 1.74.194V21l4.155-4.155" /></svg>回复</button>
+              ${isOwner ? `<button onclick="deleteComment(${c.id})" class="inline-flex items-center gap-1 text-red-500 hover:text-red-600 transition-colors"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-4 h-4"><path stroke-linecap="round" stroke-linejoin="round" d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0" /></svg>删除</button>` : ''}
+            </div>
+            <div id="replyForm-${c.id}" class="hidden mt-4">
+              <textarea id="replyContent-${c.id}" rows="2" placeholder="回复 ${escapeHtml(c.username)}..." class="w-full p-3 border rounded-md focus:outline-none focus:ring-2 focus:ring-primary/50"></textarea>
+              <div class="flex items-center gap-2 mt-2">
+                <button onclick="postReply(${c.id})" class="px-3 py-2 bg-primary text-white rounded hover:bg-primary/90 transition-colors">发布回复</button>
+                <button onclick="toggleReplyForm(${c.id})" class="px-3 py-2 border border-gray-300 rounded hover:bg-gray-50 transition-colors">取消</button>
+              </div>
+            </div>
+            ${repliesHtml ? `<div class="mt-4 bg-gray-50 rounded-lg p-3">${repliesHtml}</div>` : ''}
+          </div>`;
+      });
+    }
+    commentList.innerHTML = html;
+  } catch (e) {
+    document.getElementById('commentList').innerHTML = '<div class="text-red-500 text-center py-6">加载失败</div>';
+  }
+}
+
+function renderReflectionStatus(reflection) {
+  const statusEl = document.getElementById('reflectionStatus');
+  const viewEl = document.getElementById('reflectionView');
+  if (!statusEl || !viewEl) return;
+  if (reflection && reflection.content) {
+    const lastTime = reflection.update_time || reflection.create_time;
+    statusEl.innerText = lastTime ? `最后提交时间：${lastTime}` : '已提交';
+    viewEl.classList.remove('hidden');
+    viewEl.innerText = `你的反思内容：\n\n${reflection.content}`;
+    const submitBtn = document.getElementById('submitReflectionBtn');
+    if (submitBtn) submitBtn.innerText = '更新反思';
+    const textarea = document.getElementById('reflectionContent');
+    if (textarea) textarea.value = reflection.content;
+  } else {
+    statusEl.innerText = '尚未提交';
+    viewEl.classList.add('hidden');
+    viewEl.innerText = '';
+    const submitBtn = document.getElementById('submitReflectionBtn');
+    if (submitBtn) submitBtn.innerText = '提交反思';
+    const textarea = document.getElementById('reflectionContent');
+    if (textarea) textarea.value = '';
+  }
+}
+
+async function loadPreviewReflection(expId) {
+  if (!isLogin || !expId) return;
+  try {
+    const res = await fetch(`/api/student/preview-reflection/${expId}`, {
+      credentials: 'include'
+    });
+    const result = await res.json();
+    if (result.code === 1 && result.data) {
+      renderReflectionStatus(result.data);
+    }
+  } catch (e) {
+    console.error('Failed to load preview reflection', e);
+  }
+}
+
+async function submitPreviewReflection(expId) {
+  if (!expId) return;
+  if (!(await checkLogin())) {
+    alert('请先登录');
+    location.href = '/public/user.html';
+    return;
+  }
+
+  const textarea = document.getElementById('reflectionContent');
+  if (!textarea) return;
+  const content = textarea.value.trim();
+  if (!content) {
+    alert('请填写反思内容');
+    return;
+  }
+  if (content.length > 1000) {
+    alert('反思内容不能超过 1000 个字符');
+    return;
+  }
+
+  try {
+    const res = await fetch('/api/student/preview-reflection', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ expId, content })
+    });
+    const data = await res.json();
+    if (data.code === 1) {
+      alert('提交成功。你可以在下方预览区域查看反思内容。');
+      renderReflectionStatus(data.data || { content });
+      reportStudentAction('提交反思', '已完成');
+    } else {
+      alert(data.msg || '提交失败');
+    }
+  } catch (e) {
+    alert('提交失败，请稍后重试');
+  }
+}
+
+// ==================== 可填写实验数据表格（弹窗版，支持多表格） ====================
+
+/**
+ * 按 `|` 切出 markdown 表格一行的字段。
+ * 只去掉语法自带的首尾空字段（`| a | b |` → ['a','b']）——**中间的空格是真实数据列，必须留下**。
+ * 返回**未 trim** 的原始片段：合并单元格里未转义的 `|` 时要还原原文。
+ * ⚠️ 与 frontend/teacher/experiment.js 里的同名函数**必须逐字一致**（学生端只读展示、教师端生成，两边同一份口径）。
+ */
+function splitMarkdownRow(line) {
+  const raw = String(line).trim().split('|');
+  if (raw.length && raw[0].trim() === '') raw.shift();
+  if (raw.length && raw[raw.length - 1].trim() === '') raw.pop();
+  return raw;
+}
+
+/**
+ * 是否是 markdown 表格的分隔行（`|:---:|---:|`）
+ * 也认模板作者自造的对齐行 `| :c: | :c: |`（想写「居中」的简写）。它不是合法 markdown，
+ * 但同样**绝不是数据**：不认它，表里就会凭空多出一行 ":c:"（exp33/exp34 共 10 张表这么写）。
+ * 旧实现只是碰巧跳过了它（一律丢掉正文第 1 行），不是真认出来了。
+ */
+function isMarkdownSeparatorRow(line) {
+  const cells = splitMarkdownRow(line).map(c => c.trim());
+  if (!cells.length) return false;
+  if (cells.every(c => /^:?-+:?$/.test(c))) return true;
+  return cells.length >= 2 && cells.every(c => /^:?c:?$/i.test(c));
+}
+
+/**
+ * 把一行整理成 cells：少于表头补空，多于表头就把多出来的片段**并回最后一格**。
+ * ⚠️ 合并而非截断：单元格里未转义的 `|`（如「用 |A₁|=|A₂| 检验」）会被切碎，截断会把备注整段吃掉。
+ */
+function normalizeMarkdownRowCells(raw, headerCount) {
+  if (headerCount <= 0) return [];
+  if (raw.length > headerCount) {
+    const merged = raw.slice(headerCount - 1).join('|').trim();
+    return raw.slice(0, headerCount - 1).map(c => c.trim()).concat([merged]);
+  }
+  const cells = raw.map(c => c.trim());
+  while (cells.length < headerCount) cells.push('');
+  return cells;
+}
+
+/**
+ * 解析 markdown 表格 → { headers, rows }
+ * 表头取「含 | 且下一行是分隔行」的那一行，所以表格前面写「### 标题」不会被当成表头
+ * （旧实现一律取第一行：`### 表格2：…` 会被解析成 1 列，整张表当场塌掉）。
+ */
+function parseMarkdownTable(mdText) {
+  if (!mdText || !mdText.trim()) return null;
+  const lines = String(mdText).replace(/\r\n?/g, '\n').split('\n');
+
+  let headerIdx = -1, firstPipeIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].trim() || !lines[i].includes('|')) continue;
+    if (firstPipeIdx < 0) firstPipeIdx = i;
+    if (i + 1 < lines.length && isMarkdownSeparatorRow(lines[i + 1])) { headerIdx = i; break; }
+  }
+  if (headerIdx < 0) headerIdx = firstPipeIdx;      // 没写分隔行的退回第一行含 | 的
+  if (headerIdx < 0) return null;
+
+  const headers = splitMarkdownRow(lines[headerIdx]).map(c => c.trim());
+  if (headers.length === 0 || !headers.some(h => h)) return null;
+
+  const rows = [];
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line.trim() || !line.includes('|')) continue;   // 空行 / 表格外的说明行
+    if (isMarkdownSeparatorRow(line)) continue;          // 分隔行
+    rows.push({ cells: normalizeMarkdownRowCells(splitMarkdownRow(line), headers.length) });
+  }
+
+  return { headers, rows };
+}
+
+function generateTableHTML(tableDef, editable = false, fillData = null, tableId) {
+  if (!tableDef || !tableDef.headers || tableDef.headers.length === 0) {
+    return '<div class="text-gray-400 text-sm">表格定义为空</div>';
+  }
+  const { headers, rows } = tableDef;
+  let html = '<table class="w-full border-collapse border border-gray-300">';
+  html += '<thead><tr>';
+  headers.forEach(h => {
+    html += `<th class="border border-gray-300 bg-gray-100 px-3 py-2 text-sm font-semibold text-gray-700">${parseMarkdownWithMath(h)}</th>`;
+  });
+  html += '</tr></thead><tbody>';
+  rows.forEach((row, ri) => {
+    html += '<tr>';
+    row.cells.forEach((cell, ci) => {
+      const value = fillData && fillData[ri] && fillData[ri].cells ? fillData[ri].cells[ci] || '' : cell;
+      if (editable) {
+        const tableAttr = tableId !== undefined ? ` data-table-id="${tableId}"` : '';
+        html += `<td class="border border-gray-300 px-2 py-1"><input type="text" class="data-table-input w-full border border-gray-400 bg-white text-sm p-1.5 focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary rounded"${tableAttr} data-row="${ri}" data-col="${ci}" value="${escapeHtml(value)}" placeholder="输入数据（支持 $\\LaTeX$ 公式）"></td>`;
+      } else {
+        html += `<td class="border border-gray-300 px-3 py-2 text-sm text-gray-700">${parseMarkdownWithMath(value)}</td>`;
+      }
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  return html;
+}
+
+/** 学生端多表格数据 */
+let studentTables = [];          // 教师定义的多个表格 [{ id, name, tableDef }]
+let studentSavedData = null;    // 已保存的多表格数据 { tables: [{ id, name, headers, rows }] }
+
+async function initFillableDataTable(expData) {
+  const container = document.getElementById('fillableDataTableContainer');
+  const tableEl = document.getElementById('fillableDataTable');
+  if (!container || !tableEl) return;
+
+  const defStr = expData.dataTableDefinition;
+  if (!defStr) {
+    container.classList.add('hidden');
+    return;
+  }
+
+  let tables = [];
+  try {
+    const parsed = JSON.parse(defStr);
+    if (Array.isArray(parsed)) {
+      tables = parsed;
+    } else if (parsed && parsed.tableDef) {
+      // 兼容旧版单表
+      tables = [{ id: 0, name: '数据表格', tableDef: parsed.tableDef }];
+    }
+  } catch (e) {
+    container.classList.add('hidden');
+    return;
+  }
+
+  if (tables.length === 0) {
+    container.classList.add('hidden');
+    return;
+  }
+
+  // 确保每个表格都有 tableDef
+  tables = tables.filter(t => t.tableDef && t.tableDef.headers && t.tableDef.headers.length > 0);
+  if (tables.length === 0) {
+    container.classList.add('hidden');
+    return;
+  }
+
+  studentTables = tables;
+  container.classList.remove('hidden');
+
+  // 绑定按钮
+  const openBtn = document.getElementById('openDataRecordModalBtn');
+  if (openBtn) openBtn.onclick = openDataRecordFillModal;
+  const closeBtns = document.querySelectorAll('#closeDataRecordFillModal, #closeDataRecordFillModalFooter');
+  closeBtns.forEach(btn => { if (btn) btn.onclick = closeDataRecordFillModal; });
+  const saveBtn = document.getElementById('saveDataRecordBtn');
+  if (saveBtn) saveBtn.onclick = saveDataRecord;
+  const loadBtn = document.getElementById('loadSavedDataBtn');
+  if (loadBtn) loadBtn.onclick = loadSavedDataRecord;
+  // 导出为图片：数据表格区与填写弹窗各一个入口，走同一套逻辑
+  const exportBtn = document.getElementById('exportDataRecordImageBtn');
+  if (exportBtn) exportBtn.onclick = openDataRecordExport;
+  const exportBtnInModal = document.getElementById('exportDataRecordImageBtnModal');
+  if (exportBtnInModal) exportBtnInModal.onclick = openDataRecordExport;
+  const modal = document.getElementById('dataRecordFillModal');
+  if (modal) modal.addEventListener('click', (e) => { if (e.target === modal) closeDataRecordFillModal(); });
+
+  // 加载已保存数据
+  studentSavedData = await fetchSavedData();
+
+  // 渲染静态预览
+  renderStudentTablePreview();
+}
+
+function renderStudentTablePreview() {
+  const tableEl = document.getElementById('fillableDataTable');
+  if (!tableEl || !studentTables.length) return;
+
+  const statusEl = document.getElementById('dataRecordStatus');
+
+  // 手机端：11 列的宽表在 390px 下不会被压成 31px 宽的格子，改渲染成
+  // 「一个测量点一张卡 → 点开看该点全部数据」的列表（与填写弹窗同一套组件）。
+  if (window.MobileDataRecord && window.MobileDataRecord.isEnabled()) {
+    window.MobileDataRecord.mount({
+      slot: 'preview',
+      host: tableEl,
+      tables: studentTables,
+      saved: studentSavedData      // 预览没有源 input，数据只能从已保存的那份读
+    });
+  }
+
+  if (studentTables.length === 1) {
+    // 单表格：直接显示
+    const t = studentTables[0];
+    const saved = studentSavedData && studentSavedData.tables ? studentSavedData.tables.find(st => st.id === t.id) : null;
+    if (!(window.MobileDataRecord && window.MobileDataRecord.isEnabled())) {
+      tableEl.innerHTML = generateTableHTML(t.tableDef, false, saved ? saved.rows : null, t.id);
+      if (window.MobileDataRecord) window.MobileDataRecord.decorateScrollers(tableEl);
+    }
+    if (statusEl) statusEl.innerText = saved ? `✅ 已填写（${studentSavedData.updateTime || ''}）` : '尚未填写';
+    return;
+  }
+
+  // 多表格：显示轮播标签 + 每个表格
+  let html = '<div class="space-y-6">';
+  studentTables.forEach((t, idx) => {
+    const saved = studentSavedData && studentSavedData.tables ? studentSavedData.tables.find(st => st.id === t.id) : null;
+    const name = t.name || ('表格' + (idx + 1));
+    html += `<div class="border border-gray-200 rounded-lg p-3 bg-white">
+      <div class="text-sm font-semibold text-secondary mb-2">📊 ${parseMarkdownWithMath(name)}</div>
+      ${generateTableHTML(t.tableDef, false, saved ? saved.rows : null, t.id)}
+    </div>`;
+  });
+  html += '</div>';
+  if (!(window.MobileDataRecord && window.MobileDataRecord.isEnabled())) {
+    tableEl.innerHTML = html;
+    // 手机端：宽表只能横向滚，加一条「左右滑动」提示（不加提示学生以为表格被截断了）
+    if (window.MobileDataRecord) window.MobileDataRecord.decorateScrollers(tableEl);
+  }
+  if (statusEl) {
+    const hasAll = studentTables.every(t => studentSavedData && studentSavedData.tables && studentSavedData.tables.find(st => st.id === t.id));
+    if (hasAll && studentSavedData) {
+      statusEl.innerText = `✅ 已填写（${studentSavedData.updateTime || ''}）`;
+    } else if (studentSavedData) {
+      statusEl.innerText = '⚠️ 部分已填写';
+    } else {
+      statusEl.innerText = '尚未填写';
+    }
+  }
+}
+
+async function fetchSavedData() {
+  const expId = getUrlParam('id');
+  if (!expId || !isLogin) return null;
+  try {
+    const res = await fetch(`/api/student/data-record/${expId}`, { credentials: 'include' });
+    const result = await res.json();
+    if (result.code === 1 && result.data) {
+      let td = null;
+      try {
+        td = typeof result.data.table_data === 'string' ? JSON.parse(result.data.table_data) : result.data.table_data;
+      } catch (e) {}
+      if (td) {
+        td.updateTime = result.data.update_time || result.data.create_time;
+      }
+      return td;
+    }
+  } catch (e) {
+    console.error('加载已保存数据失败', e);
+  }
+  return null;
+}
+
+function openDataRecordFillModal() {
+  const modal = document.getElementById('dataRecordFillModal');
+  const editor = document.getElementById('fillableDataTableEditor');
+  if (!modal || !editor || !studentTables.length) return;
+
+  fetchSavedData().then(savedData => {
+    studentSavedData = savedData;
+
+    if (studentTables.length === 1) {
+      // 单表格
+      const t = studentTables[0];
+      const saved = savedData && savedData.tables ? savedData.tables.find(st => st.id === t.id) : null;
+      editor.innerHTML = generateTableHTML(t.tableDef, true, saved ? saved.rows : null, t.id);
+    } else {
+      // 多表格：每个表格一块
+      let html = '<div class="space-y-8">';
+      studentTables.forEach((t, idx) => {
+        const saved = savedData && savedData.tables ? savedData.tables.find(st => st.id === t.id) : null;
+        const name = t.name || ('表格' + (idx + 1));
+        html += `<div class="border border-gray-200 rounded-lg p-4">
+          <div class="text-base font-semibold text-secondary mb-2">📊 ${parseMarkdownWithMath(name)}</div>
+          ${generateTableHTML(t.tableDef, true, saved ? saved.rows : null, t.id)}
+        </div>`;
+      });
+      html += '</div>';
+      editor.innerHTML = html;
+    }
+
+    // 绑定键盘方向键导航
+    bindDataTableKeyboardNav(editor);
+
+    // 手机端：编辑器仍在 DOM 里（保存/导出照旧读它），只在它上面盖一层「选一行 / 一个点」的填写界面
+    if (window.MobileDataRecord && window.MobileDataRecord.isEnabled()) {
+      window.MobileDataRecord.mount({ slot: 'editor', editor: editor, host: editor.parentElement, tables: studentTables });
+    }
+
+    modal.classList.remove('hidden');
+    modal.classList.add('flex');
+    document.body.style.overflow = 'hidden';
+  });
+}
+
+function closeDataRecordFillModal() {
+  const modal = document.getElementById('dataRecordFillModal');
+  if (window.MobileDataRecord) window.MobileDataRecord.unmount('editor');
+  if (!modal) return;
+  modal.classList.add('hidden');
+  modal.classList.remove('flex');
+  document.body.style.overflow = '';
+}
+
+// ============ 4.1 数据记录表 → 导出 PNG 图片（贴进 Word / WPS 实验报告） ============
+/** 导出时间文本：2026-09-15 14:20（本地时区） */
+function formatExportTime() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 读取填写弹窗里**当前输入框**的值（未保存也能导出）；弹窗未开时返回 null */
+function readDataRecordEditorRows() {
+  const modal = document.getElementById('dataRecordFillModal');
+  const editor = document.getElementById('fillableDataTableEditor');
+  if (!modal || !editor || modal.classList.contains('hidden')) return null;
+  const map = new Map();
+  studentTables.forEach(t => {
+    const rows = [];
+    for (let ri = 0; ri < (t.tableDef.rows || []).length; ri++) {
+      const cells = [];
+      for (let ci = 0; ci < (t.tableDef.headers || []).length; ci++) {
+        const input = editor.querySelector(`input[data-table-id="${t.id}"][data-row="${ri}"][data-col="${ci}"]`);
+        cells.push(input ? input.value : '');
+      }
+      rows.push({ cells });
+    }
+    map.set(String(t.id), rows);
+  });
+  return map;
+}
+
+/**
+ * 组装某张表用于导出的内容（单元格全部转成「已渲染的 HTML」，与页面所见一致）。
+ * 取值优先级：填写弹窗里的当前输入 > 已保存数据 > 表格定义里的预设单元格
+ */
+function buildExportTable(tableId) {
+  const t = studentTables.find(x => String(x.id) === String(tableId));
+  if (!t) return null;
+  const live = readDataRecordEditorRows();
+  let rows = null;
+  if (live && live.has(String(tableId))) rows = live.get(String(tableId));
+  else if (studentSavedData && Array.isArray(studentSavedData.tables)) {
+    const s = studentSavedData.tables.find(x => String(x.id) === String(tableId));
+    if (s && Array.isArray(s.rows)) rows = s.rows;
+  }
+  const headers = (t.tableDef.headers || []).map(h => parseMarkdownWithMath(h));
+  const body = (t.tableDef.rows || []).map((defRow, ri) => {
+    const preset = (defRow && defRow.cells) || [];
+    return headers.map((_, ci) => {
+      const filled = rows && rows[ri] && rows[ri].cells ? rows[ri].cells[ci] : null;
+      const raw = (filled != null && String(filled).trim() !== '') ? filled : (preset[ci] || '');
+      return parseMarkdownWithMath(raw);
+    });
+  });
+  return { id: t.id, name: t.name, nameHtml: parseMarkdownWithMath(t.name || ''), headers, rows: body };
+}
+
+/** 打开「导出为图片」弹窗 */
+async function openDataRecordExport() {
+  if (!studentTables.length) return;
+  if (!window.TableImageExport || typeof window.TableImageExport.open !== 'function') {
+    alert('导出组件未加载，请刷新页面后重试');
+    return;
+  }
+  // 顶部信息行要印「姓名 + 学号」。姓名/学号取自信任源：页面已缓存的 currentUser 优先，
+  // 缺学号时现查一次 /api/auth/me（老会话、或缓存的是教师身份时都可能没有）。
+  let me = currentUser;
+  if (!me || !me.studentNumber) {
+    try {
+      const r = await fetch('/api/auth/me', { credentials: 'include' });
+      const j = await r.json();
+      if (j.code === 1 && j.data) me = j.data;
+    } catch (e) { /* 查不到就用已有的（图片上少一行信息，不影响导出） */ }
+  }
+  window.TableImageExport.open({
+    tables: studentTables.map(t => ({ id: t.id, name: t.name })),
+    resolve: buildExportTable,
+    meta: {
+      expName: (currentExp && currentExp.name) || '',
+      studentName: (me && me.username) || (currentUser && currentUser.username) || '',
+      studentNumber: (me && me.studentNumber) || '',
+      timeText: formatExportTime()
+    }
+  });
+}
+
+async function saveDataRecord() {
+  const editor = document.getElementById('fillableDataTableEditor');
+  if (!editor || !studentTables.length) return;
+
+  if (!(await checkLogin())) {
+    alert('请先登录');
+    location.href = '/public/user.html';
+    return;
+  }
+
+  // 收集所有表格数据
+  const tablesData = [];
+  for (const t of studentTables) {
+    const rows = [];
+    for (let ri = 0; ri < t.tableDef.rows.length; ri++) {
+      const cells = [];
+      for (let ci = 0; ci < t.tableDef.headers.length; ci++) {
+        const input = editor.querySelector(`input[data-table-id="${t.id}"][data-row="${ri}"][data-col="${ci}"]`);
+        cells.push(input ? input.value : '');
+      }
+      rows.push({ cells });
+    }
+    tablesData.push({ id: t.id, name: t.name, headers: t.tableDef.headers, rows });
+  }
+
+  const tableData = { tables: tablesData };
+  const expId = getUrlParam('id');
+  if (!expId) return;
+
+  try {
+    const res = await fetch('/api/student/data-record', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ expId, tableData })
+    });
+    const data = await res.json();
+    if (data.code === 1) {
+      alert('实验数据保存成功！');
+      closeDataRecordFillModal();
+      studentSavedData = { tables: tablesData, updateTime: new Date().toLocaleString() };
+      renderStudentTablePreview();
+    } else {
+      alert(data.msg || '保存失败');
+    }  } catch (err) {
+    alert('保存失败，请稍后重试');
+  }
+}
+
+async function loadSavedDataRecord() {
+  const editor = document.getElementById('fillableDataTableEditor');
+  if (!editor || !studentTables.length) return;
+
+  const savedData = await fetchSavedData();
+  if (!savedData || !savedData.tables) {
+    alert('没有已保存的数据');
+    return;
+  }
+
+  studentSavedData = savedData;
+
+  if (studentTables.length === 1) {
+    const t = studentTables[0];
+    const saved = savedData.tables.find(st => st.id === t.id);
+    if (saved && saved.rows) {
+      editor.innerHTML = generateTableHTML(t.tableDef, true, saved.rows, t.id);
+    }
+  } else {
+    let html = '<div class="space-y-8">';
+    studentTables.forEach(t => {
+      const saved = savedData.tables.find(st => st.id === t.id);
+      const name = t.name || '';
+      html += `<div class="border border-gray-200 rounded-lg p-4">
+        <div class="text-base font-semibold text-secondary mb-2">📊 ${parseMarkdownWithMath(name)}</div>
+        ${generateTableHTML(t.tableDef, true, saved ? saved.rows : null, t.id)}
+      </div>`;
+    });
+    html += '</div>';
+    editor.innerHTML = html;
+  }
+
+  // 绑定键盘方向键导航
+  bindDataTableKeyboardNav(editor);
+
+  // 手机端：重建了编辑器内容 → 手机界面要跟着重建（否则还停在上一次的旧值上）
+  if (window.MobileDataRecord && window.MobileDataRecord.isEnabled()) {
+    window.MobileDataRecord.mount({ slot: 'editor', editor: editor, host: editor.parentElement, tables: studentTables });
+  }
+
+  alert('已恢复上次保存的数据');
+}
+
+/**
+ * 键盘方向键导航：在 data-table-input 之间用上下左右键移动焦点
+ */
+function bindDataTableKeyboardNav(container) {
+  if (!container) return;
+  // 移除旧的监听器（用标记避免重复绑定）
+  if (container._keyboardNavBound) return;
+  container._keyboardNavBound = true;
+
+  container.addEventListener('keydown', function (e) {
+    const input = e.target;
+    if (!input.classList.contains('data-table-input')) return;
+
+    const key = e.key;
+    if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab'].includes(key)) return;
+
+    const row = parseInt(input.dataset.row);
+    const col = parseInt(input.dataset.col);
+    const tableId = input.dataset.tableId;
+    if (isNaN(row) || isNaN(col)) return;
+
+    const isTab = key === 'Tab';
+    const isShift = e.shiftKey;
+
+    // Tab / Shift+Tab 走默认行为，不拦截
+    if (isTab) return;
+
+    e.preventDefault();
+
+    // 计算目标行列
+    let targetRow = row, targetCol = col;
+    // 收集当前 table 内所有 inputs
+    let selector = '.data-table-input';
+    if (tableId) selector += `[data-table-id="${tableId}"]`;
+
+    const allInputs = container.querySelectorAll(selector);
+    if (allInputs.length === 0) return;
+
+    // 根据方向计算新位置
+    const colsCount = studentTables.length === 1
+      ? studentTables[0].tableDef.headers.length
+      : guessColCount(allInputs);
+
+    switch (key) {
+      case 'ArrowUp':    targetRow = Math.max(0, row - 1); break;
+      case 'ArrowDown':  targetRow = row + 1; break;
+      case 'ArrowLeft':  targetCol = Math.max(0, col - 1); break;
+      case 'ArrowRight': targetCol = col + 1; break;
+    }
+
+    // 查找目标 input
+    let targetQuery = `.data-table-input[data-row="${targetRow}"][data-col="${targetCol}"]`;
+    if (tableId) targetQuery += `[data-table-id="${tableId}"]`;
+
+    let target = container.querySelector(targetQuery);
+
+    // 如果目标不存在（越界），尝试换行
+    if (!target && (key === 'ArrowLeft' || key === 'ArrowRight')) {
+      if (key === 'ArrowRight' && targetCol >= colsCount) {
+        targetQuery = `.data-table-input[data-row="${row + 1}"][data-col="0"]`;
+        if (tableId) targetQuery += `[data-table-id="${tableId}"]`;
+        target = container.querySelector(targetQuery);
+      } else if (key === 'ArrowLeft' && targetCol < 0) {
+        targetQuery = `.data-table-input[data-row="${row - 1}"][data-col="${colsCount - 1}"]`;
+        if (tableId) targetQuery += `[data-table-id="${tableId}"]`;
+        target = container.querySelector(targetQuery);
+      }
+    }
+
+    if (target) {
+      target.focus();
+      target.select();
+    }
+  });
+}
+
+function guessColCount(inputs) {
+  let max = 0;
+  inputs.forEach(inp => {
+    const c = parseInt(inp.dataset.col);
+    if (!isNaN(c) && c > max) max = c;
+  });
+  return max + 1;
+}
+
+window.onload = async function() {
+  studyStartTime = Date.now();
+  // 阅读计时基准同步置位：beforeunload 用它算「本次阅读秒数」上报。
+  // 只靠 initAssignmentTimer 赋值是不行的 —— 它在「教师未设阅读时限」与「已提交」两条路径上
+  // 会提前 return，sessionStartTime 留在初始值 0，于是 beforeunload 把 epoch 秒数（约 17.9 亿）
+  // 当成阅读时长上报，把 reading_progress 冲成天文数字（实测已有 3,570,257,186 秒的行），
+  // 使阅读时长门槛失效 —— 而作业解锁硬闸正是读这张表。
+  sessionStartTime = Date.now();
+
+  // 进入实验学习前必须登录
+  const loggedIn = await checkLogin();
+  if (!loggedIn) {
+    alert('请先登录学生账号');
+    location.href = '/public/user.html';
+    return;
+  }
+
+  const expId = getUrlParam('id');
+  if (!expId) { alert('实验未找到'); return; }
+
+  // 立刻预取「已累积阅读秒数」：它决定 5.4 倒计时的起点。
+  // 放在这里（而不是等下面四次串行 await 之后）是为了让正确数字尽早出现 ——
+  // 否则学生会先看到 --:-- 好几秒，请求一旦失败还会退化成满额。
+  prefetchReadingBase(expId);
+
+  // 邮箱绑定检查：未绑定则跳转到个人中心
+  try {
+    const emailRes = await fetch('/api/student/email-status', { credentials: 'include' });
+    const emailData = await emailRes.json();
+    if (emailData.code === 1 && !emailData.data.bound) {
+      alert('请先绑定邮箱后再进行实验学习');
+      location.href = '/public/user.html?bindEmail=1';
+      return;
+    }
+  } catch (e) {
+    console.error('邮箱检查失败', e);
+  }
+
+  try {
+    const res = await fetch(`/api/experiment/${expId}`);
+    const result = await res.json();
+    if (result.code === 1) {
+      const expData = result.data;
+      currentExp = expData;
+      renderExpContent(expData);
+      await loadPreviewReflection(expId);
+
+      const submitReflectionBtn = document.getElementById('submitReflectionBtn');
+      if (submitReflectionBtn) {
+        submitReflectionBtn.addEventListener('click', () => submitPreviewReflection(expId));
+      }
+
+      const submitted = await checkSubmissionStatus(expId);
+
+      if (!submitted) {
+        const limitMinutes = expData.reading_limit_time || 0;
+        initAssignmentTimer(limitMinutes * 60, expId);
+      }
+
+      // 加载自测题目
+      await loadQuiz(expId);
+
+      // 初始化可填写数据表格
+      initFillableDataTable(expData);
+
+      await addStudyRecord();
+      await loadComments();
+
+      const enterBtn = document.getElementById('enterAssignmentBtn');
+      if (enterBtn) enterBtn.href = `assignment.html?expId=${expId}`;
+
+      // 从 assignment.html 被前置检查退回时（?locked=1）：说明原因并滚到 5.4，别让学生以为是页面出错
+      if (getUrlParam('locked') === '1') {
+        const lockedArea = document.getElementById('assignmentLocked');
+        if (lockedArea && !lockedArea.classList.contains('hidden')) {
+          const lockTitle = lockedArea.querySelector('h4');
+          const lockDesc = lockedArea.querySelector('p');
+          if (lockTitle) lockTitle.innerText = '作业模块尚未解锁';
+          if (lockDesc) lockDesc.innerText = '需先满足阅读时长并完成 5.3 实验自测，达标后自动开启作业提交入口。';
+          lockedArea.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }
+
+      reportStudentAction('进入实验页面', '已完成');
+    } else {
+      alert('实验未找到');
+    }
+  } catch (e) {
+    alert('加载失败');
+  }
+};
+
+window.addEventListener('beforeunload', () => {
+  // 清理阅读定时器
+  if (assignmentTimer) clearInterval(assignmentTimer);
+  if (readingSyncInterval) clearInterval(readingSyncInterval);
+
+  // 读取进度最终同步
+  const expId = getUrlParam('id');
+  if (isLogin && currentExp && currentExp.name && expId) {
+    const sessionSeconds = Math.floor((Date.now() - sessionStartTime) / 1000);
+    if (sessionSeconds > 0) {
+      fetch('/api/student/reading-progress/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expId: parseInt(expId), additionalSeconds: sessionSeconds }),
+        keepalive: true
+      }).catch(e => console.error('阅读进度同步失败:', e));
+    }
+  }
+
+  // 原有离开页面时长上报
+  if (isLogin && currentExp && currentExp.name) {
+    const durationSeconds = Math.floor((Date.now() - studyStartTime) / 1000);
+    if (durationSeconds > 5) {
+      fetch('/api/student/report-duration', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ experimentName: currentExp.name, duration: durationSeconds }),
+        keepalive: true
+      }).catch(e => console.error('时长上报失败:', e));
+    }
+  }
+});
+
+// ========== 阅读进度持久化 ==========
+let accumulatedBaseSeconds = 0;       // 从服务端读取的已累积阅读秒数
+let sessionStartTime = 0;            // 本次页面加载的开始时间
+let assignmentTimer = null;
+let quizCompletedForHomework = false;
+let readingSyncInterval = null;
+
+/**
+ * 保存阅读进度到服务端
+ * @param {number} expId 实验ID
+ * @param {number} sessionElapsed 本次同步间隔内累积的秒数
+ * @param {boolean} isFinal 是否为离开页面前的最终保存
+ */
+async function syncReadingProgress(expId, sessionElapsed, isFinal) {
+  const expIdNum = parseInt(expId);
+  if (!expIdNum || !sessionElapsed || sessionElapsed <= 0) return;
+  try {
+    const res = await fetch('/api/student/reading-progress/sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ expId: expIdNum, additionalSeconds: sessionElapsed }),
+      keepalive: isFinal
+    });
+    const json = await res.json().catch(() => null);
+    // ⚠️ 必须确认服务端真的存下了才推进基准。以前不看返回码就当成功，
+    // 于是「客户端以为存了、服务端没存」→ 下次进入读回的值偏小，
+    // 倒计时看起来就像「重新计时」。失败时不推进 sessionStartTime，
+    // 这段时间会在下一次同步里一起带上，不会丢。
+    if (!json || json.code !== 1) {
+      console.warn('阅读进度未写入服务端，将在下次同步时重试', json);
+      return;
+    }
+    accumulatedBaseSeconds += sessionElapsed;
+    sessionStartTime = Date.now();
+  } catch (e) {
+    console.error('同步阅读进度失败', e);
+  }
+}
+
+/* ---------------- 已累积阅读秒数的获取（可靠性优先） ----------------
+   这份数据决定倒计时的起点。⚠️ 绝不能「取不到就当成 0」—— 那会显示满额（如 35:00），
+   学生看起来就是「每次进网站都重新计时」。所以：预取 → 重试 → 回落到解锁接口的
+   remainingSeconds（服务端判定解锁用的同一口径）→ 都失败则返回 null（由调用方推迟重试）。 */
+let readingBasePromise = null;
+
+// 页面一开始就预取，别等 checkLogin/邮箱/实验/提交状态四次串行 await 之后才发
+// （实测那要 3~8 秒，学生会先看到 --:--；若中途失败更会直接退化成满额）
+function prefetchReadingBase(expId) {
+  readingBasePromise = fetch(`/api/student/reading-progress/${encodeURIComponent(expId)}`, { credentials: 'include' })
+    .then(r => r.json())
+    .then(j => (j && j.code === 1 && j.data) ? (Number(j.data.accumulated_seconds) || 0) : null)
+    .catch(() => null);
+  return readingBasePromise;
+}
+
+async function resolveBaseSeconds(expId, limitSeconds) {
+  if (readingBasePromise) {
+    const v = await readingBasePromise;
+    if (typeof v === 'number') return v;
+  }
+  for (let i = 0; i < 3; i++) {
+    try {
+      const res = await fetch(`/api/student/reading-progress/${encodeURIComponent(expId)}`, { credentials: 'include' });
+      const j = await res.json();
+      if (j && j.code === 1 && j.data) return Number(j.data.accumulated_seconds) || 0;
+    } catch (e) { /* 继续重试 */ }
+    await new Promise(r => setTimeout(r, 400 * (i + 1)));
+  }
+  // 回落：解锁接口里 remainingSeconds 与累计秒数是同一张表的同一口径
+  try {
+    const res = await fetch(`/api/student/homework-unlock/${encodeURIComponent(expId)}`, { credentials: 'include' });
+    const j = await res.json();
+    if (j && j.code === 1 && j.data && typeof j.data.remainingSeconds === 'number') {
+      return Math.max(0, limitSeconds - j.data.remainingSeconds);
+    }
+  } catch (e) { /* 落到 null */ }
+  return null;
+}
+
+function initAssignmentTimer(limitSeconds, expId) {
+    const remainingEl = document.getElementById('remainingTime');
+    const lockedArea = document.getElementById('assignmentLocked');
+    const unlockedArea = document.getElementById('assignmentUnlocked');
+    const submittedArea = document.getElementById('assignmentSubmitted');
+
+    // 如果已提交作业，不执行定时器逻辑
+    if (submittedArea && !submittedArea.classList.contains('hidden')) return;
+
+    if (!limitSeconds || limitSeconds <= 0) {
+        // 阅读时间不限，只检查自测
+        checkQuizAndUnlockHomework(expId);
+        return;
+    }
+
+    if (assignmentTimer) clearInterval(assignmentTimer);
+    if (readingSyncInterval) clearInterval(readingSyncInterval);
+
+    // 先读取服务端的已累积阅读秒数
+    (async () => {
+      const base = await resolveBaseSeconds(expId, limitSeconds);
+
+      // ⚠️ 读不到时**绝不能当成「已读 0 秒」**：那会显示满额（如 35:00），
+      // 学生看到的正是「每次进网站都重新计时」。这里保持占位符并推迟重试，
+      // 期间用服务端口径的解锁状态兜住文案（checkQuizAndUnlockHomework 会显示真实剩余）。
+      if (base === null) {
+        if (remainingEl) remainingEl.innerText = '--:--';
+        await checkQuizAndUnlockHomework(expId);
+        window.setTimeout(() => {
+          if (!assignmentTimer) { readingBasePromise = null; initAssignmentTimer(limitSeconds, expId); }
+        }, 5000);
+        return;
+      }
+      accumulatedBaseSeconds = base;
+
+      // 初始化会话开始时间
+      sessionStartTime = Date.now();
+
+      // 显示初始剩余时间（基于已累积的阅读进度）
+      const currentTotal = accumulatedBaseSeconds;
+      const remaining = Math.max(0, limitSeconds - currentTotal);
+      if (remaining > 0) {
+        const mins = Math.floor(remaining / 60);
+        const secs = remaining % 60;
+        if (remainingEl) remainingEl.innerText = `${mins}分${secs.toString().padStart(2, '0')}秒`;
+      } else {
+        // 已读够时长，直接解锁
+        if (remainingEl) remainingEl.innerText = '0分00秒';
+        checkQuizAndUnlockHomework(expId);
+        return;
+      }
+
+      // 启动每秒倒计时
+      assignmentTimer = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - sessionStartTime) / 1000);
+        const currentTotal = accumulatedBaseSeconds + elapsed;
+        const remaining = Math.max(0, limitSeconds - currentTotal);
+
+        if (remaining > 0) {
+            const mins = Math.floor(remaining / 60);
+            const secs = remaining % 60;
+            if (remainingEl) remainingEl.innerText = `${mins}分${secs.toString().padStart(2, '0')}秒`;
+        } else {
+            clearInterval(assignmentTimer);
+            assignmentTimer = null;
+            if (remainingEl) remainingEl.innerText = '0分00秒';
+            // 先把最后一段（最多 15 秒）未同步的阅读进度落库，再判定解锁：
+            // 服务端按库里的秒数判定，不补这一次会「页面说读完了、接口说还差几秒」→ 刚解锁就被退回
+            (async () => {
+                const pending = Math.floor((Date.now() - sessionStartTime) / 1000);
+                if (pending > 0) await syncReadingProgress(expId, pending, true);
+                await checkQuizAndUnlockHomework(expId);
+            })();
+        }
+      }, 1000);
+
+      // 每15秒同步一次阅读进度到服务端
+      readingSyncInterval = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - sessionStartTime) / 1000);
+        if (elapsed >= 5) {
+          syncReadingProgress(expId, elapsed, false);
+        }
+      }, 15000);
+    })();
+}
+
+/**
+ * 阅读达标后判定是否解锁作业区。判定口径完全交给服务端
+ * （GET /api/student/homework-unlock/:expId，与提交接口硬闸同一份逻辑）：
+ * 阅读时长 + 5.3 自测**都**满足才解锁。前端不再自己拼条件 ——
+ * 旧实现在 self_test_required===0 或自测已完成时直接解锁，阅读没读够也能进。
+ */
+async function checkQuizAndUnlockHomework(expId) {
+    const lockedArea = document.getElementById('assignmentLocked');
+    const unlockedArea = document.getElementById('assignmentUnlocked');
+
+    try {
+        const res = await fetch(`/api/student/homework-unlock/${expId}`, { credentials: 'include' });
+        const json = await res.json();
+        const state = json.code === 1 ? json.data : null;
+        if (!state) throw new Error(json.msg || '解锁状态查询失败');
+
+        if (state.unlocked) {
+            quizCompletedForHomework = true;
+            if (lockedArea) lockedArea.classList.add('hidden');
+            if (unlockedArea) unlockedArea.classList.remove('hidden');
+            return;
+        }
+
+        // 未解锁：区分「自测没做」与「阅读还没读够」，落到锁框文案上
+        if (lockedArea) lockedArea.classList.remove('hidden');
+        if (unlockedArea) unlockedArea.classList.add('hidden');
+
+        const remainingEl = document.getElementById('remainingTime');
+        if (state.needQuiz) {
+            if (remainingEl) remainingEl.innerText = '请先完成上方 5.3 自测题';
+            const lockTitle = lockedArea?.querySelector('h4');
+            const lockDesc = lockedArea?.querySelector('p');
+            if (lockTitle) lockTitle.innerText = '请先完成自测';
+            if (lockDesc) lockDesc.innerText = '完成 5.3 实验自测后，将自动解锁作业提交入口。';
+        } else if (state.needReading && remainingEl && state.remainingSeconds > 0) {
+            // 客户端已满、服务端还差一点时把真实剩余时间显示出来，交给定时器继续
+            const mins = Math.floor(state.remainingSeconds / 60);
+            const secs = state.remainingSeconds % 60;
+            remainingEl.innerText = `${mins}分${secs.toString().padStart(2, '0')}秒`;
+        }
+    } catch (e) {
+        console.error('检查解锁状态失败:', e);
+    }
+}
+
+async function checkSubmissionStatus(expId) {
+    if (!isLogin || !expId) return false;
+
+    // 鍚屾椂鏌ヨ涓ゅ绯荤粺锛氭棫鐗堟祴楠岋紙System A锛夊拰鏂扮増鍒嗗潡浣滀笟锛圫ystem B锛?
+    let systemA = null;
+    let systemB = null;
+
+    try {
+        const res = await fetch(`/api/student/assignments/${expId}`, {
+            credentials: 'include'
+        });
+        const data = await res.json();
+        if (data.submission) systemA = data.submission;
+    } catch (e) {
+        console.error('检查提交状态失败', e);
+    }
+
+    try {
+        const hwRes = await fetch(`/api/homework/student-submission/${expId}`, {
+            credentials: 'include'
+        });
+        const hwData = await hwRes.json();
+        if (hwData.code === 1 && hwData.data) systemB = hwData.data;
+    } catch (e) {
+        console.error('检查作业提交状态失败', e);
+    }
+
+    // 浼樺厛瑙勫垯锛氭柊鐗堝垎鍧椾綔涓氬凡鎵规敼 鈫?鏂扮増鏈壒鏀?鈫?鏃х増娴嬮獙
+    if (systemB && systemB.blocks && systemB.blocks.some(b => (b.score || 0) > 0)) {
+        showHomeworkSubmittedUI(expId, systemB);
+        return true;
+    }
+    if (systemA) {
+        showSubmittedUI(expId, systemA);
+        return true;
+    }
+    if (systemB) {
+        showHomeworkSubmittedUI(expId, systemB);
+        return true;
+    }
+    return false;
+}
+
+function showSubmittedUI(expId, submission) {
+    if (assignmentTimer) {
+        clearInterval(assignmentTimer);
+        assignmentTimer = null;
+    }
+
+    const lockedArea = document.getElementById('assignmentLocked');
+    const unlockedArea = document.getElementById('assignmentUnlocked');
+    const submittedArea = document.getElementById('assignmentSubmitted');
+    const statusEl = document.getElementById('assignmentStatus');
+
+    if (lockedArea) lockedArea.classList.add('hidden');
+    if (unlockedArea) unlockedArea.classList.add('hidden');
+    if (submittedArea) submittedArea.classList.remove('hidden');
+
+    if (statusEl) {
+        statusEl.innerHTML = '<i class="fa-solid fa-circle-check"></i> Submitted';
+        statusEl.className = 'text-xs px-2 py-1 bg-green-100 text-green-600 rounded-full flex items-center gap-1';
+    }
+
+    const statusText = document.getElementById('submissionStatusText');
+    const scoreText = document.getElementById('submissionScoreText');
+
+    if (statusText) {
+        const statusMap = { pending: 'Pending', grading: 'Grading', graded: 'Graded' };
+        statusText.innerText = statusMap[submission.status] || submission.status || 'Unknown';
+    }
+
+    if (scoreText) {
+        scoreText.innerText = submission.score != null ? submission.score : '--';
+    }
+
+    const viewBtn = document.getElementById('viewAssignmentBtn');
+    if (viewBtn) viewBtn.href = `assignment.html?expId=${expId}`;
+}
+
+function showHomeworkSubmittedUI(expId, submission) {
+    if (assignmentTimer) {
+        clearInterval(assignmentTimer);
+        assignmentTimer = null;
+    }
+
+    const lockedArea = document.getElementById('assignmentLocked');
+    const unlockedArea = document.getElementById('assignmentUnlocked');
+    const submittedArea = document.getElementById('assignmentSubmitted');
+
+    if (lockedArea) lockedArea.classList.add('hidden');
+    if (unlockedArea) unlockedArea.classList.add('hidden');
+    if (submittedArea) submittedArea.classList.remove('hidden');
+
+    const statusEl = document.getElementById('assignmentStatus');
+    if (statusEl) {
+        statusEl.innerHTML = '<i class="fa-solid fa-circle-check"></i> Submitted';
+        statusEl.className = 'text-xs px-2 py-1 bg-green-100 text-green-600 rounded-full flex items-center gap-1';
+    }
+
+    const statusText = document.getElementById('submissionStatusText');
+    const scoreText = document.getElementById('submissionScoreText');
+
+    const isGraded = submission.blocks && submission.blocks.some(b => (b.score || 0) > 0);
+
+    if (statusText) {
+        statusText.innerText = isGraded ? 'Graded' : 'Pending grading';
+    }
+
+    if (scoreText) {
+        if (isGraded) {
+            scoreText.innerText = `${submission.total_score} / ${submission.max_score}`;
+        } else {
+            scoreText.innerText = 'Pending grading';
+        }
+    }
+
+    // Change button to open grade review modal
+    const viewBtn = document.getElementById('viewAssignmentBtn');
+    if (viewBtn) {
+        if (isGraded) {
+            viewBtn.innerHTML = '<i class="fa-solid fa-file-pen"></i> 查看批改详情';
+        viewBtn.href = `grade-review.html?id=${submission.id}`;
+            viewBtn.target = '_blank';
+            viewBtn.onclick = null;
+        } else {
+            viewBtn.innerHTML = '<i class="fa-solid fa-eye"></i> 查看作业详情';
+            viewBtn.href = `assignment.html?expId=${expId}`;
+            viewBtn.onclick = null;
+        }
+    }
+}
+
+// ============================================================
+// Grade Review 鈥?ePen 鍗＄墖椋庢牸锛孠aTeX 娓叉煋锛孴ab/Shift+Tab 鍒囨崲
+// ============================================================
+let _gradeBlocks = [];
+let _gradeActiveIdx = 0;
+
+function openGradeReview(submission) {
+    const modal = document.getElementById('gradeReviewModal');
+    if (!modal) return;
+
+  const reviewBlocks = submission.blocks || [];
+  // 兜底口径必须与接口（/api/homework/student-submission/:expId 的 computeBlockTotals）一致：
+  // 只累加能取到满分的块，且单块得分按 min(score, max) 封顶 —— 否则接口算出的数和这里的兜底
+  // 会是两个数（历史上就是这里不封顶、不跳 null）。
+  const totalScore = typeof submission.total_score === 'number'
+    ? submission.total_score
+    : reviewBlocks.reduce((sum, block) => sum + (block.max_score == null ? 0 : Math.min(block.score || 0, Number(block.max_score))), 0);
+  const maxScore = typeof submission.max_score === 'number'
+    ? submission.max_score
+    : reviewBlocks.reduce((sum, block) => sum + (block.max_score == null ? 0 : Number(block.max_score)), 0);
+
+  document.getElementById('gradeTotalScore').textContent = totalScore;
+  document.getElementById('gradeMaxScore').textContent = maxScore;
+
+    // 鏂囦欢棰勮
+    const filePreview = document.getElementById('gradeFilePreview');
+    const fileName = document.getElementById('gradeFileName');
+    const fileLink = document.getElementById('gradeFileLink');
+    const fileViewer = document.getElementById('gradeFileViewer');
+    const fileIframe = document.getElementById('gradeFileIframe');
+    const toggleBtn = document.getElementById('gradeFileToggleBtn');
+
+    if (submission.file_path) {
+        const filePath = submission.file_path;
+        const fileNameOnly = filePath.split('/').pop() || 'Unknown file';
+        const isPdf = fileNameOnly.toLowerCase().endsWith('.pdf');
+        // file_path 可能是无前导斜杠（PDF 直交为 uploads/experiments/...）或带斜杠，统一补 '/'（同 resolveFileUrl 口径）
+        const fileUrl = (/^(https?:)?\//.test(filePath) ? filePath : '/' + filePath) + '?_t=' + Date.now();
+
+        fileName.textContent = fileNameOnly;
+        fileLink.href = fileUrl;
+
+        if (isPdf) {
+            // PDF 鈫?iframe 鐩存帴棰勮
+            fileIframe.src = fileUrl;
+            fileViewer.style.display = 'none';
+            toggleBtn.style.display = 'inline-block';
+            toggleBtn.innerHTML = '<i class="fa-solid fa-eye"></i> 在线预览';
+            toggleBtn.dataset.open = 'false';
+        } else {
+            // Word 鈫?涓嶆敮鎸?iframe 棰勮锛屾樉绀轰笅杞芥彁绀?
+            fileViewer.style.display = 'none';
+            toggleBtn.style.display = 'none';
+            // 鍦ㄩ瑙堝尯鏄剧ず涓嬭浇鎻愮ず
+            const existingNotice = document.querySelector('.grade-file-dl-notice');
+            if (!existingNotice) {
+                const notice = document.createElement('div');
+                notice.className = 'grade-file-dl-notice mx-4 mb-4 p-6 bg-gray-50 border border-dashed border-gray-300 rounded-lg text-center';
+                notice.innerHTML = '<i class="fa-regular fa-file-word text-4xl text-blue-500 mb-3"></i>'
+                    + '<p class="text-sm text-gray-600 mb-3">Word 文档暂不支持在线预览</p>'
+                    + '<a href="' + fileUrl + '" download class="inline-flex items-center gap-2 px-5 py-2 bg-primary text-white text-sm rounded-lg hover:bg-blue-700 transition-colors">'
+                    + '<i class="fa-solid fa-download"></i> 涓嬭浇鏂囦欢</a>';
+                filePreview.parentNode.insertBefore(notice, filePreview.nextSibling);
+            }
+        }
+        filePreview.classList.remove('hidden');
+    } else {
+        filePreview.classList.add('hidden');
+    }
+
+    _gradeBlocks = submission.blocks || [];
+    _gradeActiveIdx = 0;
+
+    const container = document.getElementById('gradeBlocksContainer');
+    container.innerHTML = '';
+
+    if (_gradeBlocks.length === 0) {
+        container.innerHTML = '<div class="text-center text-gray-400 py-8">暂无分块数据</div>';
+        modal.classList.remove('hidden');
+        document.body.style.overflow = 'hidden';
+        return;
+    }
+
+    _gradeBlocks.forEach((block, i) => {
+        const card = document.createElement('div');
+        card.className = 'grade-card';
+        card.id = 'grade-card-' + i;
+        card.style.cssText = `
+            background: #fff;
+            border-radius: 14px;
+            padding: 28px 32px;
+            border: 2.5px solid transparent;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.03);
+            transition: box-shadow 0.25s, border-color 0.25s;
+            margin-bottom: 20px;
+        `;
+
+        const pName = block.partition_name || '棰濆鍐呭';
+        // 与接口同口径：满分取不到时（接口返回 null）按 '--' 展示，能取到时得分按 Math.min 封顶，
+        // 避免手输超满分时这里印出比接口总数还大的单块分。
+        const blockMax = (block.max_score === null || block.max_score === undefined || block.max_score === '')
+            ? null : Number(block.max_score);
+        const maxScore = blockMax === null ? '--' : blockMax;
+        const score = blockMax === null ? (block.score || 0) : Math.min(block.score || 0, blockMax);
+        const crossMarks = (block.annotations || []).filter(a => a.type === 'cross').length;
+        const marks = (block.annotations || []).filter(a => a.type === 'check').length;
+        const highlights = (block.annotations || []).filter(a => a.type === 'highlight').length;
+
+        // Header
+        const header = document.createElement('div');
+        header.style.cssText = `
+            display: flex; justify-content: space-between; align-items: center;
+            margin-bottom: 16px; padding-bottom: 12px;
+            border-bottom: 1.5px solid #f0f0f0;
+        `;
+        header.innerHTML = `
+            <span style="font-size:1.125rem;font-weight:700;color:#0E2B5C;">
+                ${escapeHtml(pName)}
+                <span style="font-size:0.875rem;font-weight:400;color:#9ca3af;margin-left:8px;">#${i + 1}</span>
+            </span>
+            <span style="font-size:0.9375rem;font-weight:700;color:${score > 0 ? '#059669' : '#9ca3af'};">
+                ${score} / ${maxScore}
+            </span>
+        `;
+        card.appendChild(header);
+
+        // Content area with KaTeX rendering
+        const content = document.createElement('div');
+        content.id = 'grade-content-' + i;
+        content.style.cssText = `
+            line-height: 1.75; color: #1f2937; font-size: 0.9375rem;
+            position: relative; min-height: 40px;
+        `;
+        content.innerHTML = renderGradeContent(block.content_md || '');
+        card.appendChild(content);
+
+        // Annotation indicators
+        if (crossMarks > 0 || marks > 0 || highlights > 0) {
+            const annDiv = document.createElement('div');
+            annDiv.style.cssText = 'margin-top:12px;display:flex;gap:12px;';
+          if (crossMarks > 0) {
+            annDiv.innerHTML += '<span style="font-size:0.8125rem;color:#ef4444;"><i class="fa-solid fa-times-circle"></i> ' + crossMarks + '个八叉</span>';
+          }
+          if (marks > 0) {
+                annDiv.innerHTML += '<span style="font-size:0.8125rem;color:#059669;"><i class="fa-solid fa-check-circle"></i> ' + marks + '处批改标记</span>';
+            }
+            if (highlights > 0) {
+                annDiv.innerHTML += '<span style="font-size:0.8125rem;color:#d97706;"><i class="fa-solid fa-highlighter"></i> ' + highlights + '处高亮标记</span>';
+            }
+            card.appendChild(annDiv);
+        }
+
+        // Render annotations (cross/check)
+        renderGradeCheckmarks(i);
+
+        container.appendChild(card);
+
+        // Click to focus card
+        card.addEventListener('click', function() {
+            setGradeActive(i);
+        });
+    });
+
+    // Activate first card
+    setGradeActive(0);
+    modal.classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+}
+
+function toggleGradeFileViewer() {
+    const viewer = document.getElementById('gradeFileViewer');
+    const btn = document.getElementById('gradeFileToggleBtn');
+    const isOpen = btn.dataset.open === 'true';
+    if (isOpen) {
+        viewer.style.display = 'none';
+        btn.innerHTML = '<i class="fa-solid fa-eye"></i> 在线预览';
+        btn.dataset.open = 'false';
+    } else {
+        viewer.style.display = 'block';
+        btn.innerHTML = '<i class="fa-solid fa-times"></i> 关闭预览';
+        btn.dataset.open = 'true';
+    }
+}
+
+function closeGradeReview(event) {
+    const modal = document.getElementById('gradeReviewModal');
+    if (!modal) return;
+    if (event && event.target !== modal) return;
+    modal.classList.add('hidden');
+    document.body.style.overflow = '';
+    _gradeBlocks = [];
+    // 娓呯悊鏂囦欢棰勮鍖虹殑涓嬭浇鎻愮ず
+    const notice = document.querySelector('.grade-file-dl-notice');
+    if (notice) notice.remove();
+}
+
+// Render markdown 鈫?KaTeX HTML (read-only)
+function renderGradeContent(md) {
+    if (!md || !md.trim()) return '<span style="color:#9ca3af;font-style:italic;">（无内容）</span>';
+
+    let processed = md
+        // Replace data URI images
+        .replace(/!\[([^\]]*)\]\(data:image\/[^)]+\)/g, function(_, alt) {
+            return '<div style="margin:12px 0;padding:16px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:8px;text-align:center;font-size:0.875rem;color:#2563eb;"><i class="fa-regular fa-image"></i> [图片: ' + (alt || '实验图片') + ']</div>';
+        })
+        // Add newline after ## headers when text follows immediately
+        .replace(/^(##\s+[^\n]+?)(\*\*[^*].*)$/gm, '$1\n\n$2')
+        // Separate adjacent bold groups
+        .replace(/\*\*([^*]+)\*\*\*\*([^*]+)\*\*/g, '**$1**\n\n**$2**')
+        // Fix 锛?followed by **
+        .replace(/([锛?])[\s銆€]*\*\*/g, '$1\n\n**')
+        // Ensure blank line before ## headers
+        .replace(/([^\n])\n(##\s)/g, '$1\n\n$2')
+        // Fix Chinese punctuation without space
+        .replace(/([銆傦紱])(?!\n)(\S)/g, '$1\n$2');
+
+    let html = marked.parse(processed);
+    // Display math $$...$$
+    html = html.replace(/\$\$([\s\S]*?)\$\$/g, function(_, eq) {
+        try { return katex.renderToString(eq.trim(), { displayMode: true, throwOnError: false }); }
+        catch (e) { return '<div style="color:#f87171;font-size:0.875rem;">[公式解析错误]</div>'; }
+    });
+    // Inline math $...$
+    html = html.replace(/\$([\s\S]*?)\$/g, function(_, eq) {
+        try { return katex.renderToString(eq.trim(), { displayMode: false, throwOnError: false }); }
+        catch (e) { return '<span style="color:#f87171;font-size:0.875rem;">[公式解析错误]</span>'; }
+    });
+    return html;
+}
+
+// Render checkmark SVGs from stored annotations
+function renderGradeCheckmarks(blockIndex) {
+    const block = _gradeBlocks[blockIndex];
+    const contentEl = document.getElementById('grade-content-' + blockIndex);
+    if (!contentEl || !block) return;
+
+    // Remove existing checkmarks
+    contentEl.querySelectorAll('.grade-checkmark').forEach(function(el) { el.remove(); });
+
+    (block.annotations || []).forEach(function(ann) {
+    if (ann.type !== 'check' && ann.type !== 'cross') return;
+        const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        svg.setAttribute('class', 'grade-checkmark');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none');
+    svg.setAttribute('stroke', ann.type === 'cross' ? '#ef4444' : '#22c55e');
+        svg.setAttribute('stroke-width', '3');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+        svg.style.cssText = `
+            position: absolute; width: 30px; height: 30px;
+            transform: translate(-50%, -50%); z-index: 10;
+            pointer-events: none;
+            filter: drop-shadow(0 1px 3px rgba(34,197,94,0.3));
+        `;
+        svg.style.left = (ann.x * 100) + '%';
+        svg.style.top = (ann.y * 100) + '%';
+
+        if (ann.type === 'cross') {
+          svg.setAttribute('viewBox', '0 0 28 34');
+          svg.style.width = '32px';
+          svg.style.height = '36px';
+          svg.style.transform = 'translate(-50%, -100%)';
+
+          const line1 = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+          line1.setAttribute('x1', '4');
+          line1.setAttribute('y1', '4');
+          line1.setAttribute('x2', '24');
+          line1.setAttribute('y2', '24');
+          svg.appendChild(line1);
+
+          const line2 = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+          line2.setAttribute('x1', '24');
+          line2.setAttribute('y1', '4');
+          line2.setAttribute('x2', '4');
+          line2.setAttribute('y2', '24');
+          svg.appendChild(line2);
+
+          const badge = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+          badge.setAttribute('x', '5');
+          badge.setAttribute('y', '24');
+          badge.setAttribute('width', '18');
+          badge.setAttribute('height', '10');
+          badge.setAttribute('rx', '4');
+          badge.setAttribute('fill', '#ef4444');
+          badge.setAttribute('stroke', 'none');
+          svg.appendChild(badge);
+
+          const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+          text.setAttribute('x', '14');
+          text.setAttribute('y', '32');
+          text.setAttribute('text-anchor', 'middle');
+          text.setAttribute('fill', '#fff');
+          text.setAttribute('font-size', '9');
+          text.setAttribute('font-weight', '700');
+          text.textContent = '-' + (ann.deduction || 0);
+          svg.appendChild(text);
+        } else {
+          const polyline = document.createElementNS('http://www.w3.org/2000/svg', 'polyline');
+          polyline.setAttribute('points', '20 6 9 17 4 12');
+          svg.appendChild(polyline);
+        }
+        contentEl.appendChild(svg);
+    });
+}
+
+// Active card management & keyboard navigation
+function setGradeActive(index) {
+    if (index < 0 || index >= _gradeBlocks.length) return;
+    _gradeActiveIdx = index;
+
+    document.querySelectorAll('.grade-card').forEach(function(c, i) {
+        if (i === index) {
+            c.style.borderColor = '#165DFF';
+            c.style.boxShadow = '0 2px 6px rgba(22,93,255,0.10), 0 8px 20px rgba(22,93,255,0.08), 0 16px 36px rgba(22,93,255,0.04)';
+        } else {
+            c.style.borderColor = 'transparent';
+            c.style.boxShadow = '0 1px 3px rgba(0,0,0,0.06), 0 4px 12px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.03)';
+        }
+    });
+
+    // Scroll active into view
+    const target = document.getElementById('grade-card-' + index);
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+    const nav = document.getElementById('gradeBlockNav');
+    if (nav) nav.textContent = (index + 1) + ' / ' + _gradeBlocks.length;
+}
+
+function isTypingStudent(target) {
+    if (!target) return false;
+    var tag = target.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target.isContentEditable;
+}
+
+// Tab/Shift+Tab for grade review modal
+document.addEventListener('keydown', function(e) {
+    const modal = document.getElementById('gradeReviewModal');
+    if (!modal || modal.classList.contains('hidden')) return;
+    if (isTypingStudent(e.target)) return;
+
+    if (e.key === 'Tab') {
+        e.preventDefault();
+        if (e.shiftKey) {
+            if (_gradeActiveIdx > 0) setGradeActive(_gradeActiveIdx - 1);
+        } else {
+            if (_gradeActiveIdx < _gradeBlocks.length - 1) setGradeActive(_gradeActiveIdx + 1);
+        }
+    }
+    if (e.key === 'Escape') {
+        closeGradeReview();
+    }
+});
+
+// ==================== 图片/视频放大查看模态框 ====================
+function openMediaModal(src, type) {
+    const modal = document.getElementById('mediaModal');
+    const content = document.getElementById('mediaModalContent');
+    const label = document.getElementById('mediaModalLabel');
+    if (!modal || !content) return;
+
+    // decodeURIComponent 安全还原 URL（因为 onclick 中用了 encodeURIComponent）
+    const realSrc = decodeURIComponent(src);
+    const escapedSrc = escapeHtml(realSrc);
+
+    if (type === 'video') {
+        // 根据扩展名推断 MIME 类型
+        const ext = (realSrc.match(/\.(mp4|webm|ogg|mov|m4v)(\?.*)?$/i) || [])[1]?.toLowerCase() || 'mp4';
+        const mimeMap = { mp4: 'mp4', webm: 'webm', ogg: 'ogg', mov: 'mp4', m4v: 'mp4' };
+        const mime = mimeMap[ext] || 'mp4';
+        content.innerHTML = `<video controls preload="auto" style="max-width:90vw; max-height:90vh; display:block; border-radius:8px; background:#000;">
+            <source src="${escapedSrc}" type="video/${mime}">
+            您的浏览器不支持该视频播放。
+        </video>`;
+        label.textContent = '点击外部区域或 × 关闭';
+    } else {
+        content.innerHTML = `<img src="${escapedSrc}" alt="放大查看" style="max-width:90vw; max-height:90vh; object-fit:contain; border-radius:8px;">`;
+        label.textContent = '点击外部区域或 × 关闭';
+    }
+    modal.classList.add('active');
+    document.body.style.overflow = 'hidden';
+}
+
+// ==================== 视频弹窗播放（不跳转、不自动播放） ====================
+window.openVideoModal = function(el) {
+    const src = el ? el.dataset.videoSrc : '';
+    const kind = el ? el.dataset.videoKind : 'iframe';
+    const title = el ? (el.dataset.videoTitle || '') : '';
+    if (!src) return;
+    const modal = document.getElementById('mediaModal');
+    const content = document.getElementById('mediaModalContent');
+    const label = document.getElementById('mediaModalLabel');
+    if (!modal || !content) return;
+    const escapedSrc = escapeHtml(src);
+    const titleHtml = title ? `<div class="video-modal-title">${escapeHtml(title)}</div>` : '';
+    if (kind === 'file') {
+        // 本地视频文件：直接 <video> 播放（不带 autoplay）
+        const ext = (src.match(/\.(mp4|webm|ogg|mov|m4v)(\?.*)?$/i) || [])[1]?.toLowerCase() || 'mp4';
+        const mimeMap = { mp4: 'mp4', webm: 'webm', ogg: 'ogg', mov: 'mp4', m4v: 'mp4' };
+        const mime = mimeMap[ext] || 'mp4';
+        content.innerHTML = `${titleHtml}<video controls preload="auto" style="max-width:90vw; max-height:90vh; display:block; border-radius:8px; background:#000;">
+            <source src="${escapedSrc}" type="video/${mime}">
+            您的浏览器不支持该视频播放。
+        </video>`;
+    } else {
+        // 站外播放器：弹窗内嵌 iframe（不带 autoplay 参数）
+        content.innerHTML = `${titleHtml}<iframe src="${escapedSrc}" allowfullscreen allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture" style="width:80vw; max-width:1000px; height:45vw; max-height:calc(90vh - 88px); border:0; border-radius:8px; background:#000; display:block;"></iframe>`;
+    }
+    label.textContent = '点击外部区域或 × 关闭';
+    modal.classList.add('active');
+    document.body.style.overflow = 'hidden';
+};
+
+// 全局点击委托：点击播放卡片或卡片下方的视频名称 → 弹窗播放视频
+document.addEventListener('click', function(e) {
+    const wrap = e.target && e.target.closest ? e.target.closest('.video-play-wrap') : null;
+    if (!wrap) return;
+    const card = wrap.querySelector ? wrap.querySelector('.video-play-card') : null;
+    if (card) window.openVideoModal(card);
+});
+
+function closeMediaModal() {
+    const modal = document.getElementById('mediaModal');
+    const content = document.getElementById('mediaModalContent');
+    if (!modal) return;
+    modal.classList.remove('active');
+    document.body.style.overflow = '';
+    if (content) {
+        const video = content.querySelector('video');
+        if (video) { video.pause(); video.currentTime = 0; }
+        content.innerHTML = '';
+    }
+}
+
+// ESC 键关闭模态框
+document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') closeMediaModal();
+});
+
+// ==================== 学生端图片轮播导航 ====================
+window.stuCarouselSlide = function(id, dir) {
+  const container = document.getElementById(id);
+  if (!container) return;
+  const items = container.querySelectorAll('.carousel-item');
+  const dots = container.querySelectorAll('.carousel-dot');
+  let active = 0;
+  items.forEach((item, i) => { if (item.classList.contains('active')) active = i; });
+  if (items[active]) items[active].classList.remove('active');
+  if (dots[active]) dots[active].classList.remove('active');
+  active = (active + dir + items.length) % items.length;
+  if (items[active]) items[active].classList.add('active');
+  if (dots[active]) dots[active].classList.add('active');
+};
+
+window.stuCarouselGo = function(id, idx) {
+  const container = document.getElementById(id);
+  if (!container) return;
+  const items = container.querySelectorAll('.carousel-item');
+  const dots = container.querySelectorAll('.carousel-dot');
+  items.forEach((item, i) => { item.classList.remove('active'); if (dots[i]) dots[i].classList.remove('active'); });
+  if (items[idx]) items[idx].classList.add('active');
+  if (dots[idx]) dots[idx].classList.add('active');
+};
+
+// ============================================================
+// 5.3 实验自测功能
+// ============================================================
+// ⚠️ 选项顺序**只由服务端决定**：首次抽题时打乱一次并写入试卷快照（self_test_papers），
+// 之后每次访问都原样复用。前端**绝不能再打乱一次** —— 学生已提交的答案是按当时的
+// 选项字母存的（self_test_completions.answers），再洗一遍会让「我的答案」标记到别的
+// 选项文本上，✓/✗ 也会与记录的总分自相矛盾。
+let quizState = {
+    questions: [],
+    userAnswers: {},
+    submitted: false,
+    expId: null
+};
+
+async function loadQuiz(expId) {
+    quizState.expId = expId;
+    const loadingEl = document.getElementById('quizLoading');
+    const areaEl = document.getElementById('quizArea');
+    const emptyEl = document.getElementById('quizEmpty');
+    const actionsEl = document.getElementById('quizActions');
+    const resultEl = document.getElementById('quizResult');
+    const skippedEl = document.getElementById('quizSkipped');
+
+    // 如果教师已关闭自测要求，直接显示已跳过状态
+    if (currentExp && currentExp.self_test_required === 0) {
+        if (loadingEl) loadingEl.classList.add('hidden');
+        if (areaEl) areaEl.classList.add('hidden');
+        if (emptyEl) emptyEl.classList.add('hidden');
+        if (actionsEl) actionsEl.classList.add('hidden');
+        if (resultEl) resultEl.classList.add('hidden');
+        if (skippedEl) skippedEl.classList.remove('hidden');
+        return;
+    }
+
+    try {
+        const res = await fetch(`/api/student/self-test/${expId}`, { credentials: 'include' });
+        const json = await res.json();
+        if (json.code !== 1 || !json.data || !json.data.questions || json.data.questions.length === 0) {
+            loadingEl.classList.add('hidden');
+            emptyEl.classList.remove('hidden');
+            return;
+        }
+
+        // 题序与选项顺序都直接采用服务端返回的试卷快照（防抄袭的洗牌在服务端做过一次并已落库），
+        // 已提交的学生因此看到的就是自己作答当时的排版，作答痕迹原样保留。
+        quizState.questions = json.data.questions;
+        const completion = json.data.completion;
+
+        if (completion) {
+            // 已提交过自测：只读回显 —— 保持学生交卷时的题目/选项顺序与作答标记
+            quizState.submitted = true;
+            renderQuizResult(completion.score, completion.total, true);
+            renderQuizQuestions(true, completion);
+        } else {
+            // 未提交，显示可作答模式
+            quizState.submitted = false;
+            renderQuizQuestions(false, null);
+            actionsEl.classList.remove('hidden');
+        }
+
+        loadingEl.classList.add('hidden');
+        areaEl.classList.remove('hidden');
+
+        // 绑定提交按钮
+        const submitBtn = document.getElementById('submitQuizBtn');
+        const retryBtn = document.getElementById('retryQuizBtn');
+        if (submitBtn) {
+            submitBtn.onclick = () => submitQuiz(expId);
+        }
+        if (retryBtn) {
+            retryBtn.onclick = () => retryQuiz(expId);
+        }
+    } catch (e) {
+        console.error('加载自测失败:', e);
+        loadingEl.innerHTML = '<p class="text-red-500">加载失败</p>';
+    }
+}
+
+function renderQuizQuestions(readonly, completion) {
+    const areaEl = document.getElementById('quizArea');
+    if (!areaEl) return;
+
+    const savedAnswers = (() => {
+        if (!completion || !completion.answers) return {};
+        if (typeof completion.answers === 'string') {
+            try { return JSON.parse(completion.answers); } catch(e) { return {}; }
+        }
+        return completion.answers; // 已经是对象
+    })();
+
+    let html = '';
+    quizState.questions.forEach((q, index) => {
+        let options = q.options || [];
+        const qNum = index + 1;
+        // 已提交（只读）时所有控件禁用
+        const disabled = readonly ? 'disabled' : '';
+        
+        // 构建选项HTML
+        let optionsHtml = '';
+        if (q.type === 'single' || q.type === 'boolean') {
+            const opts = q.type === 'boolean' ? ['对', '错'] : options;
+            opts.forEach((opt, optIdx) => {
+                const label = q.type === 'boolean' ? opt : String.fromCharCode(65 + optIdx);
+                const inputId = `quiz_${q.id}_${optIdx}`;
+                const checked = readonly && savedAnswers[q.id] === label ? 'checked' : '';
+                // 判断题不显示 A/B 标签前缀，直接显示对/错
+                const displayText = q.type === 'boolean' ? opt : `${label}. ${opt}`;
+                // 渲染选项中的 LaTeX 公式
+                const renderedOpt = renderLatex(opt);
+                optionsHtml += `<label class="flex items-center gap-2 p-2 rounded hover:bg-gray-50 ${checked ? 'bg-blue-50' : ''}">
+                    <input type="radio" name="quiz_${q.id}" value="${label}" id="${inputId}" ${checked} ${disabled} class="w-4 h-4 text-primary">
+                    <span>${q.type === 'boolean' ? renderedOpt : `${label}. ${renderedOpt}`}</span>
+                </label>`;
+            });
+        } else if (q.type === 'multiple') {
+            options.forEach((opt, optIdx) => {
+                const label = String.fromCharCode(65 + optIdx);
+                const savedArr = readonly && savedAnswers[q.id] ? savedAnswers[q.id].split(',') : [];
+                const checked = savedArr.includes(label) ? 'checked' : '';
+                const renderedOpt = renderLatex(opt);
+                optionsHtml += `<label class="flex items-center gap-2 p-2 rounded hover:bg-gray-50 ${checked ? 'bg-blue-50' : ''}">
+                    <input type="checkbox" name="quiz_${q.id}" value="${label}" ${checked} ${disabled} class="w-4 h-4 text-primary">
+                    <span>${label}. ${renderedOpt}</span>
+                </label>`;
+            });
+        } else if (q.type === 'text') {
+            const val = readonly ? (savedAnswers[q.id] || '') : '';
+            optionsHtml = `<textarea name="quiz_${q.id}" class="w-full p-3 border rounded-lg" ${disabled} placeholder="请输入你的答案...">${val}</textarea>`;
+        }
+
+        // 如果已提交，显示正确答案对比
+        let answerReview = '';
+        if (readonly) {
+            const userAns = savedAnswers[q.id] || '未作答';
+            // 选择题/判断题答案仅为字母/对错，纯文本展示即可；
+            // 简答题/开放题的参考答案与解析支持 Markdown + LaTeX 富文本（块级元素放 div 中，避免 span 嵌套块级导致结构错乱）。
+            const isChoice = q.type !== 'text';
+            const isRight = isChoice && userAns === q.answer;
+            // 对错用带底色徽章表达（避免与下方三区块主色混淆）
+            const badge = !isChoice ? '' : (isRight
+                ? '<span class="ml-1.5 inline-block align-middle px-1.5 py-0.5 rounded-md bg-green-100 text-green-700 font-medium text-xs">✓ 正确</span>'
+                : '<span class="ml-1.5 inline-block align-middle px-1.5 py-0.5 rounded-md bg-red-100 text-red-600 font-medium text-xs">✗ 错误</span>');
+            // —— 你的答案：蓝色系 ——
+            const yourAnswerHtml = `<span class="text-blue-600 font-medium break-all">${escapeHtml(userAns).replace(/\n/g, '<br>')}</span>${badge}`;
+            // —— 正确答案：绿色系 ——
+            const correctBodyHtml = isChoice
+                ? `<span class="text-green-600 font-semibold">${escapeHtml(q.answer || '详见解析')}</span>`
+                : `<div class="quiz-rich text-gray-800 mt-1 border-l-4 border-green-300 pl-2">${renderQuizRichText(q.answer || '详见解析')}</div>`;
+            // —— 解析：琥珀/橙色系 ——
+            const explanationHtml = q.explanation ? `<div class="mt-2 pt-2 border-t border-gray-200">
+                <div class="text-amber-600 font-semibold"><i class="fa-solid fa-lightbulb mr-1"></i>解析</div>
+                <div class="quiz-rich text-gray-800 mt-1 bg-amber-50 border-l-4 border-amber-300 pl-2 rounded-r-md">${renderQuizRichText(q.explanation)}</div>
+            </div>` : '';
+            answerReview = `<div class="mt-3 p-3 bg-gray-50 rounded-lg text-sm">
+                <div class="mb-1"><strong class="text-blue-600">你的答案：</strong> ${yourAnswerHtml}</div>
+                <div class="${isChoice ? '' : 'mt-1'}"><strong class="text-green-600">正确答案：</strong> ${correctBodyHtml}</div>
+                ${explanationHtml}
+            </div>`;
+        }
+
+        html += `<div class="p-4 border border-gray-200 rounded-xl bg-white">
+            <p class="font-bold text-gray-800 mb-3">${qNum}. ${renderLatex(q.question)}
+                ${renderQuizCategoryBadge(q.category)}
+            </p>
+            <div class="space-y-1">${optionsHtml}</div>
+            ${answerReview}
+        </div>`;
+    });
+
+    areaEl.innerHTML = html;
+}
+
+// 渲染题目分类标签（必做/选做/开放）
+function renderQuizCategoryBadge(category) {
+    const catMap = {
+        required: { label: '必做题', color: '#165DFF' },
+        optional: { label: '选做题', color: '#f59e0b' },
+        open: { label: '开放题', color: '#10b981' }
+    };
+    const cat = catMap[category] || catMap.required;
+    return `<span style="display:inline-block; padding:0.1rem 0.5rem; border-radius:0.25rem; background:${cat.color}; color:#fff; font-size:0.7rem; margin-left:0.375rem; vertical-align:middle;">${cat.label}</span>`;
+}
+
+async function submitQuiz(expId) {
+    // 收集答案
+    const answers = {};
+    quizState.questions.forEach(q => {
+        const radios = document.querySelectorAll(`input[name="quiz_${q.id}"]:checked`);
+        if (q.type === 'single' || q.type === 'boolean') {
+            answers[q.id] = radios.length > 0 ? radios[0].value : '';
+        } else if (q.type === 'multiple') {
+            answers[q.id] = Array.from(radios).map(r => r.value).sort().join(',');
+        } else if (q.type === 'text') {
+            const ta = document.querySelector(`textarea[name="quiz_${q.id}"]`);
+            answers[q.id] = ta ? ta.value.trim() : '';
+        }
+    });
+
+    // 检查是否所有题目都已作答
+    const unanswered = [];
+    quizState.questions.forEach((q, index) => {
+        const ans = answers[q.id];
+        if (!ans || (q.type === 'text' && ans.length === 0) || (q.type !== 'text' && ans === '')) {
+            unanswered.push(index + 1);
+        }
+    });
+    if (unanswered.length > 0) {
+        const typeLabel = { single: '单选题', multiple: '多选题', boolean: '判断题', text: '简答题' };
+        const details = unanswered.map(num => {
+            const q = quizState.questions[num - 1];
+            return `第${num}题（${typeLabel[q.type] || q.type}）`;
+        }).join('、');
+        alert(`⚠️ 还有 ${unanswered.length} 道题未作答：\n\n${details}\n\n请完成所有题目后再提交。`);
+        return;
+    }
+
+    // 计算得分（客观题）
+    let score = 0;
+    let total = 0;
+    quizState.questions.forEach(q => {
+        total += q.points || 0;
+        if (q.type === 'text') {
+            // 简答题给一半分作为鼓励
+            if (answers[q.id] && answers[q.id].length > 0) score += Math.floor((q.points || 0) / 2);
+        } else {
+            if (answers[q.id] === q.answer) score += q.points || 0;
+        }
+    });
+
+    try {
+        // 保存自测结果到后端（含答案）
+        const res = await fetch('/api/student/self-test/submit', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ expId: parseInt(expId), score, total, answers })
+        });
+        const json = await res.json();
+        if (json.code !== 1) throw new Error(json.msg);
+
+        quizState.submitted = true;
+        
+        // 记录答案以便显示
+        const completionData = { answers: JSON.stringify(answers), score, total };
+
+        // 显示结果
+        document.getElementById('quizActions').classList.add('hidden');
+        renderQuizResult(score, total, false);
+        renderQuizQuestions(true, completionData);
+
+        // 尝试解锁作业
+        await checkQuizAndUnlockHomework(expId);
+
+    } catch (e) {
+        console.error('提交自测失败:', e);
+        alert('提交失败，请重试');
+    }
+}
+
+function renderQuizResult(score, total, isFromServer) {
+    const resultEl = document.getElementById('quizResult');
+    const iconWrap = document.getElementById('quizResultIcon');
+    const iconFa = document.getElementById('quizResultIconFa');
+    const titleEl = document.getElementById('quizResultTitle');
+    const scoreEl = document.getElementById('quizResultScore');
+    const msgEl = document.getElementById('quizResultMsg');
+    const retryBtn = document.getElementById('retryQuizBtn');
+
+    if (!resultEl) return;
+
+    const pct = total > 0 ? Math.round(score / total * 100) : 0;
+
+    resultEl.classList.remove('hidden');
+    if (iconWrap) {
+        if (pct >= 60) {
+            iconWrap.className = 'w-16 h-16 mx-auto bg-green-100 text-green-600 rounded-full flex items-center justify-center mb-4';
+            iconFa.className = 'fa-solid fa-check text-3xl';
+        } else {
+            iconWrap.className = 'w-16 h-16 mx-auto bg-yellow-100 text-yellow-600 rounded-full flex items-center justify-center mb-4';
+            iconFa.className = 'fa-solid fa-book-open text-3xl';
+        }
+    }
+    if (titleEl) titleEl.textContent = pct >= 60 ? '🎉 自测完成！' : '📖 继续加油！';
+    if (scoreEl) scoreEl.textContent = `得分：${score}/${total}（${pct}%）`;
+    if (msgEl) msgEl.textContent = pct >= 60 ? '已达标，可以进入作业提交板块。' : '建议回顾实验内容后再试。';
+    if (retryBtn) retryBtn.classList.remove('hidden');
+}
+
+async function retryQuiz(expId) {
+    // 重新作答：沿用同一份试卷快照（题序与选项顺序都不变），只清空页面上的作答与结果，
+    // 保证这一遍作答的字母含义与上一遍完全一致。
+    try {
+        quizState.submitted = false;
+        document.getElementById('quizResult').classList.add('hidden');
+        document.getElementById('quizActions').classList.remove('hidden');
+        document.getElementById('retryQuizBtn').classList.add('hidden');
+        renderQuizQuestions(false, null);
+    } catch (e) {
+        console.error('重置失败:', e);
+    }
+}
