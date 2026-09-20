@@ -1,0 +1,12 @@
+# 实验数据（抓下来的表格 / 导入导出文件 / 自动备份）——不要推到 GitHub
+data/
+*.tmp
+
+# 开发依赖
+node_modules/
+
+# 含登录 cookie、服务器地址、接口细节的本地抓包笔记——不要推到 GitHub
+# （认证信息.txt / 抓接口.txt / view-source_*.html 已于本次取消跟踪；本地文件仍在，只是不再提交）
+网页信息/认证信息.txt
+网页信息/抓接口.txt
+网页信息/view-source_*.html

@@ -1,0 +1,12 @@
+{
+  "name": "webpage-table-submit-tools",
+  "private": true,
+  "version": "1.0.0",
+  "description": "近代物理实验平台：数据记录表抓取/回传的油猴脚本 + 合并逻辑离线自测",
+  "scripts": {
+    "test": "node tests/test-merge.js && node tests/test-xlsx-roundtrip.js"
+  },
+  "devDependencies": {
+    "xlsx": "0.18.5"
+  }
+}
