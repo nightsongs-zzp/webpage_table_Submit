@@ -1,6 +1,9 @@
 # 实验数据（抓下来的表格 / 导入导出文件 / 自动备份）——不要推到 GitHub
 data/
+测试/
 *.tmp
+~$*.xlsx
+~$*.xls
 
 # 开发依赖
 node_modules/

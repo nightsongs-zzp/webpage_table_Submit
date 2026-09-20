@@ -14,7 +14,7 @@ const cut = src.indexOf(marker);
 if (cut < 0) { console.error('找不到入口标记，脚本结构变了？'); process.exit(1); }
 const body = src.slice(0, cut) + '\n' +
   'return { computeMerge, buildUploadTables, buildStrictTables, parseFileToPayload, cellKey, ' +
-  'buildExportView, expCols, normCell, CLEAR_TOKEN, sanitizeSheetNames };\n})();';
+  'buildExportView, expCols, normCell, rowCells, mapLike, CLEAR_TOKEN, sanitizeSheetNames, normalizeServerTables };\n})();';
 
 // ---- 最小 DOM / window 桩 ----
 function makeEl() {
@@ -215,6 +215,51 @@ console.log('\n=== 10. 工作表名净化 ===');
   eq('长度 ≤ 31', names.every((n) => n.sheet.length <= 31), true);
   eq('名称不重复', new Set(names.map((n) => n.sheet)).size, 3);
   eq('保留 T{id}_ 前缀（导入靠它认 id）', names.map((n) => /^T\d+_/.test(n.sheet)), [true, true, true]);
+}
+
+console.log('\n=== 11. 回归：服务器 rows 是「裸数组」形态（v1.0.0 崩溃点） ===');
+{
+  // 这正是 exp22 崩溃的形态：rows: [ ["1","2"], ["3","4"] ] —— 没有 .cells
+  const server = mkServer([
+    { id: 0, name: '表0', headers: ['a', 'b'], rows: [['1', '2'], ['3', '4']] },
+  ]);
+  eq('rowCells 兼容裸数组行', fns.rowCells(['1', '2']), ['1', '2']);
+  eq('rowCells 兼容对象行', fns.rowCells({ cells: ['1'] }), ['1']);
+  eq('rowCells 兼容垃圾输入', fns.rowCells(null), []);
+  eq('expCols 兼容裸数组行（旧版在此崩）', fns.expCols(server.tables[0]), 2);
+
+  const file = mkFile([mkTable(0, ['a', 'b'], [['1', 'X'], ['3', '4']])], [mkTable(0, ['a', 'b'], [['1', '2'], ['3', '4']])]);
+  let m;
+  try { m = fns.computeMerge(file, server); } catch (e) { m = null; }
+  ok('computeMerge 不再抛错', !!m, m ? '' : '仍然抛错');
+  if (m) {
+    eq('识别 1 处改动', m.changes.length, 1);
+    const up = fns.buildUploadTables(server, m.mergedCell);
+    eq('上传体写回对象形态 {cells:[...]}', Array.isArray(up[0].rows[0].cells), true);
+    eq('改动生效', up[0].rows[0].cells[1], 'X');
+    eq('未改动保留', up[0].rows[0].cells[0], '1');
+  }
+
+  // normalizeServerTables：接口不管给哪种行形态，出口必须统一成 {cells:[]}
+  const norm = fns.normalizeServerTables({ tables: [{ id: 3, name: 'n', headers: ['h'], rows: [['x'], { cells: ['y'] }] }] });
+  eq('normalizeServerTables 出口统一', norm[0].rows, [{ cells: ['x'] }, { cells: ['y'] }]);
+  eq('normalizeServerTables 出口 expCols 可用', fns.expCols(norm[0]), 1);
+
+  // mergedCell 若是普通对象（外部调用）也不能崩
+  const upObj = fns.buildUploadTables(server, { '0|0|0': 'Z' });
+  eq('buildUploadTables 接受普通对象 mergedCell', upObj[0].rows[0].cells[0], 'Z');
+}
+
+console.log('\n=== 12. 表集合不一致：以服务器已存数据为准，不凭空加表 ===');
+{
+  // 接口模板 2 张（id 0,9），服务器已存只有 1 张（id 0）→ 导出/上传都只应出现 id 0
+  const server = mkServer([mkTable(0, ['a'], [['s']])]);
+  const file = mkFile([mkTable(0, ['a'], [['f']]), mkTable(9, ['z'], [['zz']])],
+    [mkTable(0, ['a'], [['s']]), mkTable(9, ['z'], [['']])]);
+  const m = fns.computeMerge(file, server);
+  eq('表 9 被跳过', m.warnings.some((w) => w.includes('id=9')), true);
+  const up = fns.buildUploadTables(server, m.mergedCell);
+  eq('上传体只有服务器认得的那 1 张表', up.map((t) => t.id), [0]);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

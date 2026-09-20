@@ -15,7 +15,7 @@ const SRC = path.join(__dirname, '..', 'webpage-table-sync.user.js');
 const src = fs.readFileSync(SRC, 'utf8');
 const marker = 'if (document.readyState === \'loading\')';
 const cut = src.indexOf(marker);
-const body = src.slice(0, cut) + '\nreturn { parseFileToPayload, computeMerge, buildUploadTables, cellKey, normCell, CLEAR_TOKEN, sanitizeSheetNames };\n})();';
+const body = src.slice(0, cut) + '\nreturn { parseFileToPayload, computeMerge, buildUploadTables, cellKey, normCell, CLEAR_TOKEN, sanitizeSheetNames, PRESET_SHEET, BASE_SHEET };\n})();';
 
 function makeEl() {
   return {
@@ -82,6 +82,11 @@ const baseAoa = [['表ID', '行', '列', '服务器原值（导出时快照，�
 baseline.forEach((t) => t.rows.forEach((r, ri) => r.cells.forEach((c, ci) => baseAoa.push([t.id, ri, ci, c]))));
 wb.SheetNames.push('_基线');
 wb.Sheets['_基线'] = sheetFromAoa(baseAoa, [8, 6, 6, 60]);
+// 预设页（与脚本 exportXLSX 同名同结构）
+const presetAoa = [['表ID', '行', '列', '模板预置值（导出时快照，请勿修改）']];
+tables.forEach((t) => t.rows.forEach((r, ri) => r.cells.forEach((c, ci) => presetAoa.push([t.id, ri, ci, String(c)]))));
+wb.SheetNames.push(fns.PRESET_SHEET);
+wb.Sheets[fns.PRESET_SHEET] = sheetFromAoa(presetAoa, [8, 6, 6, 60]);
 const names = fns.sanitizeSheetNames(tables.map((t) => ({ id: t.id, name: `T${t.id}_${t.name || '表' + t.id}` })));
 tables.forEach((t, idx) => {
   const aoa = [[`表 id=${t.id}  ${t.name || ''}`.trim()]];
@@ -118,11 +123,11 @@ console.log('=== A. 原样读回（未改动） ===');
   eq('LaTeX 单元格无损', p.tables[0].rows[1].cells[0], '$1.5\\times10^{-4}$');
   eq('含 | 与 , 的单元格无损', p.tables[0].rows[3].cells[0], 'x|y,z 空格 结尾 ');
   eq('带出基线', !!p.baseline, true);
+  eq('带出预设层', !!p.presets, true);
+  eq('预设层内容正确（第1行第1列=1）', p.presets.get(fns.cellKey(0, 0, 0)), '1');
   const server = { tables: JSON.parse(JSON.stringify(tables)), update_time: 't' };
   const m = fns.computeMerge(p, server);
   console.log(`     （数字/文本还原：[1800]=${JSON.stringify(p.tables[0].rows[2].cells[0])}, [0.00015]=${JSON.stringify(p.tables[0].rows[2].cells[1])}, [007]=${JSON.stringify(p.tables[0].rows[2].cells[2])}）`);
-  const numericNoise = (to, from) => to !== from;
-  const noise = m.changes.filter((c) => c.kind === 'mod' && numericNoise(c.to, c.from));
   eq('未改动 → 0 处改动（数字类型转换不产生误报）', m.changes.length, 0);
 }
 
@@ -163,8 +168,7 @@ console.log('\n=== C. 手工 Excel（无 _基线 工作表） ===');
   eq('空缺补上', up[0].rows[0].cells[1], 'new-from-user');
 }
 
-console.log('\n=== D. 含 __CLEAR__ 的 JSON 清空 ===');
-{
+console.log('\n=== D. 含 __CLEAR__ 的 JSON 清空 ===');{
   const payload = {
     tables: [{ id: 0, name: '表0', headers: ['a'], rows: [{ cells: [fns.CLEAR_TOKEN] }] }],
     _baseline: [{ id: 0, name: '表0', headers: ['a'], rows: [{ cells: ['keep'] }] }],

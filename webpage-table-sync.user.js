@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         实验数据表格 同步器（导出/导入 · 近代物理实验平台）
 // @namespace    https://github.com/nightsongs-zzp/webpage_table_Submit
-// @version      1.0.0
+// @version      1.1.2
 // @description  把 experiment.html?id=NN 里的 4.1 数据记录表（多张）导出为 JSON(主存档)+XLSX(方便手算)，本地改完后可安全回传：GET→三方合并→POST→回读校验，上传前自动备份，支持一键回滚。
 // @author       nightsongs-zzp
 // @match        http://119.91.120.143:8081/public/experiment.html*
@@ -26,13 +26,15 @@
   const CLEAR_TOKEN = '__CLEAR__';
   const XLSX_MARK = 'webpage_table_sync/v1';
   const BASE_SHEET = '_基线';
+  const PRESET_SHEET = '_预设';
   const BAK_KEY = 'wts_backup_history_v1';
   const CFG_KEY = 'wts_config_v1';
 
   const S = {
     expId: null,
-    defs: null,          // [{id, name, headers:[], expectedRows:int}] | null
+    defs: null,          // [{id, name, headers:[], expectedRows:int, presetRows:[[..]]}] | null
     defsSource: '',
+    defRowsById: new Map(), // id → 模板预置行（学生没填时页面显示的兜底值）
     server: null,        // { tables:[{id,name,headers,rows}], table_data:{...}, update_time }
     lastResponse: null,  // 上次 POST 的响应
     busy: false,
@@ -85,13 +87,38 @@
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
   function cellKey(tid, r, c) { return `${tid}|${r}|${c}`; }
+  /**
+   * 取一行的 cells。**服务器侧 / 文件侧两种行形态都必须能吃**：
+   *   - "对象形态"：{ cells: [...] }  ← 页面 saveDataRecord 写回服务器的形态（教学模板就是它）
+   *   - "裸数组形态"：[...]           ← 有些接口返回 / 老数据直接是数组
+   * 之前只认对象形态，裸数组会在 expCols() 的 r.cells.length 处抛
+   * TypeError: Cannot read properties of undefined (reading 'length')。
+   */
+  function rowCells(row) {
+    if (Array.isArray(row)) return row;
+    if (row && Array.isArray(row.cells)) return row.cells;
+    return [];
+  }
+  /**
+   * 统一 Map / 普通对象 两种"键值容器"：mergedCell 是 Map，但离线自测或外部调用
+   * 可能给普通对象，这里一次收口，避免 .has is not a function。
+   */
+  function mapLike(map) {
+    if (map && typeof map.has === 'function' && typeof map.get === 'function') return map;
+    const src = map || {};
+    return {
+      has(k) { return Object.prototype.hasOwnProperty.call(src, k); },
+      get(k) { return src[k]; },
+      forEach(fn) { Object.keys(src).forEach((k) => fn(src[k], k)); },
+    };
+  }
   function safeSheetName(raw, fallback) {
     let s = String(raw || '').replace(/[\[\]\*\/\\\?:]/g, '_').replace(/^\s+|\s+$/g, '');
     if (!s) s = fallback;
     return s.slice(0, 31);
   }
   function sanitizeSheetNames(pairs) {
-    const used = new Set([BASE_SHEET]);
+    const used = new Set([BASE_SHEET, PRESET_SHEET, '说明_README']);
     const out = [];
     for (const p of pairs) {
       let base = safeSheetName(p.name, 'T' + p.id).slice(0, 28);
@@ -113,6 +140,13 @@
     setTimeout(() => { try { document.body.removeChild(a); URL.revokeObjectURL(url); } catch (e) {} }, 4000);
   }
   function diffMs(t) { return Date.now() - t; }
+  /** 当前脚本版本（用来判断浏览器里装的是不是最新那版） */
+  function scriptVersion() {
+    try {
+      if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) return GM_info.script.version;
+    } catch (e) {}
+    return '1.1.2';
+  }
 
   // ============================================================
   // 3. 网络层（fetch 为主；被 CSP 拦时退回 GM_xmlhttpRequest）
@@ -154,8 +188,9 @@
       try { json = text ? JSON.parse(text) : null; } catch (e) { throw new Error('响应不是 JSON（HTTP ' + res.status + '）'); }
       out = { ok: res.ok, status: res.status, json };
     } catch (e) {
-      // fetch 失败（多为页面 CSP 限制 connect-src）→ 换 GM 通道重试一次
-      log('warn', `fetch 失败（${e.message}），改用 GM_xmlhttpRequest 重试…`);
+      // fetch 抛出的既有网络错误，也可能是"页面脚本自己"的类型错误 —— 都退回 GM 通道再试一次。
+      // （这样即使页面注入的 fetch 包装出问题，脚本仍有一条路可走。）
+      log('warn', `fetch 失败（${e.name}: ${e.message}），改用 GM_xmlhttpRequest 重试…`);
       out = await fetchViaGM(method, url, body);
     }
     log('net', `${method} ${url} → HTTP ${out.status}（${diffMs(t0)}ms）`);
@@ -175,6 +210,8 @@
       id: t && t.id !== undefined && t.id !== null ? t.id : 0,
       name: toStr(t && t.name),
       headers,
+      // 模板自带的"预置单元格"：学生没填时页面上显示的就是它，导出必须回落到这里
+      presetRows: rows.map((r) => rowCells(r).map(toStr)),
       expectedRows: rows.length,
     };
   }
@@ -222,7 +259,7 @@
     return defs.length ? defs : null;
   }
 
-  /** 从服务器 table_data 里取表结构 */
+  /** 从服务器 table_data 里取表结构（行形态统一收口成 {cells:[...]}） */
   function normalizeServerTables(td) {
     if (!td) return [];
     let obj = td;
@@ -236,7 +273,7 @@
         id: t && t.id !== undefined && t.id !== null ? t.id : 0,
         name: toStr(t && t.name),
         headers: Array.isArray(t.headers) ? t.headers.map(toStr) : [],
-        rows: rows.map((r) => (Array.isArray(r && r.cells) ? r.cells.map(toStr) : [])),
+        rows: rows.map((r) => ({ cells: rowCells(r).map(toStr) })),
       };
     });
   }
@@ -250,8 +287,12 @@
       const { defs, source } = extractDefs(r.json.data);
       S.defs = defs;
       S.defsSource = defs ? source : '';
+      // 预置单元格单独存一份：导出要回落、导入要拿它判断"这一格用户到底动没动"
+      S.defRowsById = new Map();
       if (defs) {
-        log('ok', `读到表格定义：${defs.length} 张表（字段 ${source}）`);
+        defs.forEach((d) => S.defRowsById.set(String(d.id), d.presetRows || []));
+        const presetCells = defs.reduce((a, d) => a + (d.presetRows || []).reduce((b, r) => b + r.filter((c) => toStr(c).trim() !== '').length, 0), 0);
+        log('ok', `读到表格定义：${defs.length} 张表（字段 ${source}），模板预置格 ${presetCells} 个`);
       } else {
         log('warn', '实验接口里没有找到 dataTableDefinition（字段名可能变了）——将用服务器已存数据和弹窗 DOM 兜底。');
       }
@@ -270,27 +311,51 @@
       table_data: data ? data.table_data : null,
       update_time: data ? (data.update_time || data.create_time || '') : '',
       raw: r.json,
+      rawTables: (data && data.table_data && Array.isArray(data.table_data.tables))
+        ? data.table_data.tables.map((t) => ({
+            id: t.id,
+            rowsIsArray: Array.isArray(t.rows),
+            row0IsArray: Array.isArray(t.rows && t.rows[0]),
+            row0Keys: (t.rows && t.rows[0] && !Array.isArray(t.rows[0])) ? Object.keys(t.rows[0]) : null,
+          }))
+        : null,
     };
     if (!tables.length) {
       log('warn', `服务器暂无已保存数据（code=${r.json && r.json.code}）——首份文件将由页面表格定义生成。`);
     } else {
       log('ok', `服务器现有 ${tables.length} 张表，最后更新：${S.server.update_time || '(无时间)'}`);
+      if (S.server.rawTables) {
+        const shapes = S.server.rawTables.slice(0, 3).map((t) => {
+          const shape = t.row0IsArray ? '裸数组' : (t.row0Keys ? `对象{${t.row0Keys.join(',')}}` : '空/未知');
+          return `id=${t.id}:rows为${t.rowsIsArray ? '数组' : '非数组'}/行0为${shape}`;
+        }).join('；');
+        log('net', `原始行形态：${shapes}${S.server.rawTables.length > 3 ? ' …' : ''}`);
+      }
     }
     return S.server;
   }
 
-  /** 确保 S.defs 可用（顺序：接口定义 → DOM 弹窗 → 服务器已存数据） */
+  /**
+   * 确保 S.defs 可用。**优先级：服务器已存数据 > 接口定义 > 弹窗 DOM**。
+   *
+   * 为什么服务器已存数据优先？—— 它才是"服务器现在真正认的表"（表数、表头、行列数）。
+   * 接口里的 dataTableDefinition 是"模板"，模板被老师改过之后可能与已存数据不一致；
+   * 用模板当基准会导出服务器上并不存在的表（实测 exp22：模板 6 张 vs 已存 8 张），
+   * 一旦把这些多出来的表 POST 回去，就可能在服务器上凭空长出表来。
+   */
   async function ensureDefs() {
-    if (S.defs && S.defs.length) return S.defs;
     if (S.server && S.server.tables.length) {
       S.defs = S.server.tables.map((t) => ({
-        id: t.id, name: t.name,
+        id: t.id,
+        name: t.name,
         headers: t.headers.slice(),
         expectedRows: t.rows.length,
+        _fromServer: true,
       }));
       if (!S.defsSource) S.defsSource = 'server';
       return S.defs;
     }
+    if (S.defs && S.defs.length) return S.defs;
     const dom = scanDomInputs();
     if (dom) {
       S.defs = dom;
@@ -301,10 +366,23 @@
     return null;
   }
 
+  /** 接口定义与服务器已存数据的差异检查（只在日志里提示，不改变基准） */
+  function checkDefsConsistency() {
+    if (!S.defs || !S.server || !S.server.tables.length) return;
+    const defIds = S.defs.map((d) => String(d.id));
+    const srvIds = S.server.tables.map((t) => String(t.id));
+    const onlyDef = defIds.filter((i) => !srvIds.includes(i));
+    const onlySrv = srvIds.filter((i) => !defIds.includes(i));
+    log('net', `表基准 = 服务器已存数据（${srvIds.length} 张：${srvIds.join(',')}）；接口模板 ${defIds.length} 张：${defIds.join(',')}`);
+    if (onlyDef.length) log('warn', `接口模板里有、服务器已存数据里没有的表 id=${onlyDef.join(',')} → 本次不会导出，也不会写回（避免凭空加表）`);
+    if (onlySrv.length) log('warn', `服务器已存数据里有、接口模板里没有的表 id=${onlySrv.join(',')} → 以服务器为准一并导出`);
+  }
+
   async function refreshAll() {
     await loadExperimentDefs();
     await loadServerData();
     await ensureDefs();
+    checkDefsConsistency();
   }
 
   // ============================================================
@@ -315,12 +393,13 @@
    * 同时给出 baseline（文件里存一份服务器快照，导入时做三方合并的基准）。
    */
   function buildExportView() {
+    // 基准就是 S.defs（refreshAll 已保证它优先取"服务器已存数据"，与服务器表集合一致）
     const defs = (S.defs && S.defs.length) ? S.defs.slice() : [];
     const serverTables = (S.server && S.server.tables) ? S.server.tables : [];
-    // 定义里没有、但服务器上有的表，也一并导出（避免"表定义接口变了导致漏表"）
+    // 兜底：定义里没有、但服务器上有的表也一并导出（避免接口字段变动导致漏表）
     serverTables.forEach((st) => {
       if (!defs.some((d) => String(d.id) === String(st.id))) {
-        defs.push({ id: st.id, name: st.name, headers: st.headers.slice(), expectedRows: st.rows.length, _fromServer: true });
+        defs.push({ id: st.id, name: st.name, headers: (st.headers || []).slice(), expectedRows: st.rows.length, _fromServer: true });
       }
     });
     const tables = [];
@@ -332,15 +411,22 @@
         continue;
       }
       const expectedRows = Math.max(d.expectedRows || 0, st ? st.rows.length : 0);
-      const cols = Math.max(d.headers.length, st ? Math.max(0, ...st.rows.map((r) => r.length)) : 0);
+      const cols = Math.max(d.headers.length, st ? Math.max(0, ...st.rows.map((r) => rowCells(r).length)) : 0);
       const headers = d.headers.slice();
       while (headers.length < cols) headers.push('');
+      const presets = S.defRowsById.get(String(d.id)) || [];
       const rows = [];
       for (let r = 0; r < expectedRows; r++) {
+        const sCells = st && st.rows[r] ? rowCells(st.rows[r]) : [];
+        const pCells = presets[r] || [];
         const cells = [];
         for (let c = 0; c < cols; c++) {
-          const sv = st && st.rows[r] ? st.rows[r][c] : undefined;
-          cells.push(sv === undefined || sv === null ? '' : toStr(sv));
+          // 取值优先级与页面一致：服务器已存值 > 模板预置值 > 空
+          // （学生没填的那些"序号/参数名"预置格，页面上是看得到的，导出也必须带上）
+          const sv = sCells[c];
+          if (sv !== undefined && sv !== null && toStr(sv) !== '') { cells.push(toStr(sv)); continue; }
+          const pv = pCells[c];
+          cells.push(pv === undefined || pv === null ? '' : toStr(pv));
         }
         rows.push({ cells });
       }
@@ -364,6 +450,18 @@
   function buildPayload() {
     const { tables, warnings } = buildExportView();
     if (!tables.length) throw new Error('没有可导出的表（缺少表头信息）');
+    const presets = tables.map((t) => {
+      const pr = S.defRowsById.get(String(t.id)) || [];
+      const cols = t.headers.length;
+      const rows = [];
+      for (let r = 0; r < t.rows.length; r++) {
+        const pc = pr[r] || [];
+        const cells = [];
+        for (let c = 0; c < cols; c++) cells.push(pc[c] === undefined || pc[c] === null ? '' : toStr(pc[c]));
+        rows.push({ cells });
+      }
+      return { id: t.id, rows };
+    });
     return {
       file: {
         app: XLSX_MARK,
@@ -378,10 +476,15 @@
         filled: filledCount(t), headers: t.headers,
       })),
       tables,
+      // 两层快照，缺一不可：
+      //   _baseline = 导出那一刻"服务器已存值"（本轮上传的写回基准）
+      //   _presets  = 模板自带的预置单元格（用来判断"用户到底动没动这一格"，
+      //              否则预置格会被误判成"用户填的"，导入时就会把模板数据写进服务器）
       _baseline: tables.map((t) => ({
         id: t.id, name: t.name, headers: t.headers,
         rows: t.rows.map((r) => ({ cells: r.cells.slice() })),
       })),
+      _presets: presets,
       _clearToken: CLEAR_TOKEN,
       _warnings: warnings,
     };
@@ -394,7 +497,7 @@
       const payload = buildPayload();
       const name = buildFileName('json');
       downloadBlob(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }), name);
-      payload._warnings.forEach((w) => log('warn', w));
+      payload.warnings.forEach((w) => log('warn', w));
       const total = payload.summary.reduce((a, s) => a + s.rows * s.cols, 0);
       const filled = payload.summary.reduce((a, s) => a + s.filled, 0);
       log('ok', `已导出 ${name}（${payload.tables.length} 张表 / ${total} 格，其中已填 ${filled} 格）`);
@@ -433,8 +536,14 @@
         ['1', '每张表一个独立工作表，表头第 1 行是表名，第 2 行是列名，第 3 行起是数据。'],
         ['2', '直接改数据行即可；公式请填 $LaTeX$ 原文（如 $1.23\\times10^{-4}$），不要填 Excel 公式。'],
         ['3', `想清空服务器上的某一格：把该格内容删成空。写 JSON 时也可以显式写 ${CLEAR_TOKEN}。`],
-        ['4', `不要改表名、列名、以及「${BASE_SHEET}」工作表，否则只能按「只补空缺」方式上传。`],
+        ['4', `不要改表名、列名、以及「${BASE_SHEET}」「${PRESET_SHEET}」两张工作表，否则只能按「只补空缺」方式上传。`],
         ['5', '改完回到网页，点「导入上传」，脚本会先 GET 服务器最新数据、三方合并、再 POST 覆盖你改动的格。'],
+        [],
+        ['关于"模板预置值"（重要）'],
+        ['P1', '有些格是老师模板里印好的（序号列、表4/表5 里印好的参数名等），它们在服务器上没有存过。'],
+        ['P2', '这类格**永远不会被上传**：页面上靠"服务器值 → 模板预置值"的回落自动显示，不需要你填，也别指望改了能生效。'],
+        ['P3', '想知道哪些格属于这一类，看「_预置值清单」工作表。'],
+        ['P4', '如果你确实要覆盖某个预置值，就直接把那一格改成你要的值 —— 改动过的格会被正常上传。'],
         [],
         ['保真提醒'],
         ['a', '本文件同时导出 JSON（主存档，无损）。做精确计算请以 JSON 为准。'],
@@ -444,7 +553,7 @@
       wb.SheetNames.push('说明_README');
       wb.Sheets['说明_README'] = sheetFromAoa(info, [14, 100]);
 
-      // ② 基线页（三方合并基准，勿改）
+      // ② 基线页 + ③ 预设页（都是三方合并的基准，勿改）
       const baseAoa = [['表ID', '行', '列', '服务器原值（导出时快照，请勿修改）']];
       payload._baseline.forEach((t) => {
         t.rows.forEach((r, ri) => r.cells.forEach((c, ci) => {
@@ -453,6 +562,15 @@
       });
       wb.SheetNames.push(BASE_SHEET);
       wb.Sheets[BASE_SHEET] = sheetFromAoa(baseAoa, [8, 6, 6, 60]);
+
+      const presetAoa = [['表ID', '行', '列', '模板预置值（导出时快照，请勿修改）']];
+      (payload._presets || []).forEach((t) => {
+        t.rows.forEach((r, ri) => r.cells.forEach((c, ci) => {
+          presetAoa.push([t.id, ri, ci, toStr(c)]);
+        }));
+      });
+      wb.SheetNames.push(PRESET_SHEET);
+      wb.Sheets[PRESET_SHEET] = sheetFromAoa(presetAoa, [8, 6, 6, 60]);
 
       // ③ 每张表一个 sheet
       const names = sanitizeSheetNames(payload.tables.map((t) => ({
@@ -467,6 +585,17 @@
         wb.SheetNames.push(sheetName);
         wb.Sheets[sheetName] = sheetFromAoa(aoa, t.headers.map((h) => Math.max(String(h || '').length + 4, 12)));
       });
+      // ④ 预置值清单页：让人一眼看出"哪些格是模板自带的、永远不会被上传"
+      const presetList = [['表ID', '行(从1数)', '列(从1数)', '列名', '模板预置值', '说明']];
+      (payload._presets || []).forEach((t) => {
+        const tbl = payload.tables.find((x) => String(x.id) === String(t.id));
+        t.rows.forEach((r, ri) => r.cells.forEach((c, ci) => {
+          if (toStr(c).trim() === '') return;
+          presetList.push([t.id, ri + 1, ci + 1, (tbl && tbl.headers[ci]) || '', toStr(c), '模板预置：改不改都不会上传']);
+        }));
+      });
+      wb.SheetNames.push('_预置值清单');
+      wb.Sheets['_预置值清单'] = sheetFromAoa(presetList, [8, 10, 10, 30, 30, 26]);
 
       const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
       const name = buildFileName('xlsx');
@@ -560,8 +689,21 @@
       } else {
         warnings.push(`没有找到「${BASE_SHEET}」工作表（可能是别人手工做的表）：本次导入只补空缺，不会清空任何服务器数据。`);
       }
+      let presets = null;
+      if (wb.Sheets[PRESET_SHEET]) {
+        const b = aoaFromSheet(XLSX, wb.Sheets[PRESET_SHEET]);
+        presets = new Map();
+        b.slice(1).forEach((r) => {
+          if (r.length < 4) return;
+          const id = String(r[0]).trim();
+          const ri = parseInt(r[1], 10), ci = parseInt(r[2], 10);
+          if (id === '' || isNaN(ri) || isNaN(ci)) return;
+          presets.set(cellKey(id, ri, ci), normCell(r[3]));
+        });
+        if (!presets.size) presets = null;
+      }
       if (!tables.length) throw new Error('这个 Excel 里没有识别到数据表（工作表名需形如 T0_表名）');
-      return { source: 'xlsx', tables, baseline, warnings };
+      return { source: 'xlsx', tables, baseline, presets, warnings };
     }
 
     // JSON
@@ -596,65 +738,125 @@
       if (!baseline.size) baseline = null;
     }
     const warnings = [];
+    let presets = null;
+    const rawPresets = Array.isArray(obj._presets) ? obj._presets : null;
+    if (rawPresets) {
+      presets = new Map();
+      rawPresets.forEach((t) => {
+        (t.rows || []).forEach((r, ri) => (r.cells || []).forEach((c, ci) => {
+          presets.set(cellKey(String(t.id), ri, ci), normCell(c));
+        }));
+      });
+      if (!presets.size) presets = null;
+    }
     if (!baseline) warnings.push('文件里没有 _baseline 快照：本次导入按「只补空缺」处理，不会清空服务器数据。');
-    return { source: 'json', tables: norm, baseline, warnings };
+    return { source: 'json', tables: norm, baseline, presets, warnings };
   }
 
   // ============================================================
   // 9. 三方合并
   // ============================================================
+  /**
+   * 纵深防御：无论上游给了什么形态的行（`{cells:[]}` 或裸数组 `[]`），统一归一成
+   * `{cells:[...]}` —— 下游一律按 `.cells` 读，两侧形态差异到此为止。
+   */
+  function normRows(rows) {
+    if (!Array.isArray(rows)) return [];
+    return rows.map((r) => ({ cells: rowCells(r).map(toStr) }));
+  }
   function serverRow(t, r) { return (t && t.rows && t.rows[r]) ? t.rows[r] : null; }
   function expCols(t) {
-    if (!t || !t.rows || !t.rows.length) return (t && t.headers ? t.headers.length : 0);
-    return Math.max(...t.rows.map((r) => r.cells.length), t.headers.length, 0);
+    if (!t) return 0;
+    const headerLen = Array.isArray(t.headers) ? t.headers.length : 0;
+    const rows = Array.isArray(t.rows) ? t.rows : [];
+    if (!rows.length) return headerLen;
+    return Math.max(...rows.map((r) => rowCells(r).length), headerLen, 0);
   }
 
   function computeMerge(file, server) {
     const changes = [];
     const mergedCell = new Map();
     const warnings = [];
-    let stats = { mod: 0, add: 0, del: 0, tables: 0, skipped: 0 };
+    let stats = { mod: 0, add: 0, del: 0, tables: 0, skipped: 0, presetSkipped: 0 };
 
-    for (const ft of file.tables) {
-      const st = server.tables.find((t) => String(t.id) === String(ft.id));
+    const fileTables = (file && Array.isArray(file.tables)) ? file.tables : [];
+    const serverTables = (server && Array.isArray(server.tables)) ? server.tables : [];
+
+    for (const ft of fileTables) {
+      const st = serverTables.find((t) => String(t.id) === String(ft.id));
       if (!st) {
         warnings.push(`表 id=${ft.id} 在服务器上不存在，整表跳过（不动服务器）`);
         stats.skipped++;
         continue;
       }
-      if (ft.headers.length && st.headers.length && ft.headers.length !== st.headers.length) {
-        warnings.push(`表 id=${ft.id}：列数不一致（文件 ${ft.headers.length} / 服务器 ${st.headers.length}），多出的列会被忽略`);
+      const fHeaders = Array.isArray(ft.headers) ? ft.headers : [];
+      const sHeaders = Array.isArray(st.headers) ? st.headers : [];
+      if (fHeaders.length && sHeaders.length && fHeaders.length !== sHeaders.length) {
+        warnings.push(`表 id=${ft.id}：列数不一致（文件 ${fHeaders.length} / 服务器 ${sHeaders.length}），多出的列会被忽略`);
       }
       stats.tables++;
-      const rows = Math.max(ft.rows.length, st.rows.length);
-      const cols = Math.max(expCols(ft), expCols(st));
+      const fRows = normRows(ft.rows);
+      const sRows = normRows(st.rows);
+      // curPresetRows = **当前模板**的预置行（预置格判定的权威来源）；
+      // ft.presetRows 只在拿不到当前模板时兜底。
+      const curPresetRows = S.defRowsById.get(String(ft.id)) || ft.presetRows || [];
+      const rows = Math.max(fRows.length, sRows.length);
+      const cols = Math.max(expCols({ headers: fHeaders, rows: fRows }), expCols({ headers: sHeaders, rows: sRows }));
       for (let r = 0; r < rows; r++) {
-        const frow = ft.rows[r];
-        const srow = serverRow(st, r);
+        const frow = fRows[r];
+        const srow = serverRow({ rows: sRows }, r);
+        const prow = curPresetRows[r] || [];
         for (let c = 0; c < cols; c++) {
           const fv = frow && c < frow.cells.length ? toStr(frow.cells[c]) : '';
           const sv = srow && c < srow.cells.length ? toStr(srow.cells[c]) : '';
+          const curPv = prow[c] === undefined || prow[c] === null ? '' : toStr(prow[c]);
           const key = cellKey(ft.id, r, c);
           const bv = file.baseline ? file.baseline.get(key) : undefined;
+          // 文件里带的 _presets 快照（= 导出那一刻模板在这一格的值）。取不到就当空：
+          // 只有"导出时为空、现在模板有值"才是模板新加的预置格，不能拿当前模板值反过来冒充快照。
+          const fpv = (file.presets && mapLike(file.presets).has(key)) ? toStr(mapLike(file.presets).get(key)) : '';
           const hasBaseline = !!file.baseline;
 
           if (fv === CLEAR_TOKEN) {
+            // 显式清空同样遵守"预置格不入库"：服务器没存过、只是模板预置值 → 清空无意义，不写
             if (sv !== '') { mergedCell.set(key, ''); changes.push({ t: ft.id, r, c, from: sv, to: '', kind: 'del' }); stats.del++; }
             continue;
           }
           if (hasBaseline) {
             const base = bv === undefined ? '' : bv;
-            if (fv === base) continue;                 // 没动过 → 保持服务器原值
-            if (fv === '') {                           // 改成空 → 视为清空
+            // 【预置格永不入库】这一格属于"模板预置、服务器上从没存过"时，文件里的值不管是什么，
+            // 只要不是用户改过的痕迹，就一律不上传：页面上靠"服务器值 → 模板预置值"回落自然显示。
+            // 判定必须用**当前模板**（curPv）而不是文件里的 _预设 快照，因为模板可能在导出之后被改过。
+            // ⚠️ 必须排在 `fv === base` 之前：_baseline 存的是"导出视图"（含预置回落值），
+            //    若先比基线，未改动的预置格会被当成"没动"、连计数都记不上。
+            if (sv === '' && curPv !== '' && (fv === '' || fv === curPv)) {
+              stats.presetSkipped++;
+              continue;
+            }
+            if (fv === base) continue;                 // 与「服务器快照」一致 → 用户没动过
+            // 兜底：导出之后模板才加上的预置值（此时 _baseline 里是空的）也算模板数据
+            if (sv === '' && curPv !== '' && fpv === '') {
+              stats.presetSkipped++;
+              continue;
+            }
+            if (fv === '') {
+              // 改成空 → 「清空这一格」。只清服务器上真实存过的值：
               if (sv !== '') { mergedCell.set(key, ''); changes.push({ t: ft.id, r, c, from: sv, to: '', kind: 'del' }); stats.del++; }
+              // 若 sv === ''（这一格只是模板预置值），上面的预置分支已 continue；这里到不了。
               continue;
             }
             if (fv === sv) continue;                   // 服务器已是最新，无需上传
             mergedCell.set(key, fv);
-            changes.push({ t: ft.id, r, c, from: sv, to: fv, kind: base === '' ? 'add' : 'mod' });
-            stats[base === '' ? 'add' : 'mod']++;
+            // 归类看"服务器上原来有没有值"，而不是看基线（基线里可能是预置回落值）
+            changes.push({ t: ft.id, r, c, from: sv, to: fv, kind: sv === '' ? 'add' : 'mod' });
+            stats[sv === '' ? 'add' : 'mod']++;
           } else {
             // 无基线（手工 Excel）：绝不覆盖服务器已有值，只补空缺
+            if (sv === '' && curPv !== '' && fv === curPv) {
+              // 模板预置格不算"空缺"：它本来就不该入库
+              stats.presetSkipped++;
+              continue;
+            }
             if (fv !== '' && sv === '') {
               mergedCell.set(key, fv);
               changes.push({ t: ft.id, r, c, from: sv, to: fv, kind: 'add' });
@@ -669,14 +871,31 @@
     return { changes, mergedCell, warnings, stats };
   }
 
-  function buildUploadTables(server, mergedCell) {
+  /** 取某张表在表头上该用的 headers：定义优先，其次服务器，最后文件 */
+  function pickHeaders(defsHeaders, serverHeaders, fileHeaders) {
+    const cands = [defsHeaders, serverHeaders, fileHeaders];
+    let best = [];
+    for (const h of cands) {
+      if (Array.isArray(h) && h.length > best.length) best = h;
+    }
+    return best.map(toStr);
+  }
+
+  function buildUploadTables(server, mergedCell, defs) {
+    const defsList = Array.isArray(defs) ? defs : [];
+    const cell = mapLike(mergedCell);
     // 以服务器全量为底，逐格覆盖改动 → 绝不触碰未改动/其他表
     return server.tables.map((t) => {
-      const rawRows = t.rows.map((r) => (Array.isArray(r) ? r : ((r && Array.isArray(r.cells)) ? r.cells : [])));
+      const rawRows = (Array.isArray(t.rows) ? t.rows : []).map((r) => rowCells(r).map(toStr));
+      const defHeaders = (() => {
+        const d = defsList.find((x) => String(x.id) === String(t.id));
+        return d && Array.isArray(d.headers) ? d.headers : null;
+      })();
+      const headers = pickHeaders(defHeaders, t.headers, null);
       // 宽度/高度要取「服务器已有」和「本次要写」的大者，否则文件新增的行列会被静默丢掉
       let maxKeyCol = -1, maxKeyRow = -1;
       const tid = String(t.id);
-      mergedCell.forEach((_v, k) => {
+      cell.forEach((_v, k) => {
         const p = String(k).split('|');
         if (p.length === 3 && p[0] === tid) {
           const rr = parseInt(p[1], 10), cc = parseInt(p[2], 10);
@@ -684,7 +903,7 @@
           if (!isNaN(cc)) maxKeyCol = Math.max(maxKeyCol, cc);
         }
       });
-      const cols = Math.max(t.headers.length, maxKeyCol + 1, ...rawRows.map((r) => r.length), 0);
+      const cols = Math.max(headers.length, maxKeyCol + 1, ...rawRows.map((r) => r.length), 0);
       const rowCount = Math.max(rawRows.length, maxKeyRow + 1, 0);
       const rows = [];
       for (let ri = 0; ri < rowCount; ri++) {
@@ -692,24 +911,34 @@
         const cells = [];
         for (let ci = 0; ci < cols; ci++) {
           const k = cellKey(t.id, ri, ci);
-          cells.push(mergedCell.has(k) ? mergedCell.get(k) : toStr(src[ci]));
+          cells.push(cell.has(k) ? cell.get(k) : toStr(src[ci]));
         }
         rows.push({ cells });
       }
-      return { id: t.id, name: t.name, headers: t.headers.slice(), rows };
+      while (headers.length < cols) headers.push('');
+      return { id: t.id, name: toStr(t.name), headers, rows };
     });
   }
 
-  function buildStrictTables(file, server) {
-    return file.tables.map((ft) => {
-      const st = server.tables.find((t) => String(t.id) === String(ft.id));
-      const headers = ft.headers.length ? ft.headers.slice() : (st ? st.headers.slice() : []);
-      const cols = headers.length;
+  function buildStrictTables(file, server, defs) {
+    const serverTables = (server && Array.isArray(server.tables)) ? server.tables : [];
+    const defsList = Array.isArray(defs) ? defs : [];
+    return (file && Array.isArray(file.tables) ? file.tables : []).map((ft) => {
+      const st = serverTables.find((t) => String(t.id) === String(ft.id));
+      const d = defsList.find((x) => String(x.id) === String(ft.id));
+      // 严格覆盖：列数以**文件**为准（定义只用来补表头文字），否则会把定义里有、文件里没有的列一起清空
+      const fRows = normRows(ft.rows);
+      const fileCols = Math.max(
+        Array.isArray(ft.headers) ? ft.headers.length : 0,
+        ...fRows.map((r) => r.cells.length), 0);
+      const headers = pickHeaders(d ? d.headers : null, st ? st.headers : null, ft.headers).slice(0, fileCols);
+      while (headers.length < fileCols) headers.push('');
+      const cols = fileCols;
       return {
         id: ft.id,
-        name: ft.name || (st ? st.name : ''),
+        name: toStr(ft.name) || (st ? toStr(st.name) : ''),
         headers,
-        rows: ft.rows.map((r) => {
+        rows: fRows.map((r) => {
           const cells = [];
           for (let c = 0; c < cols; c++) {
             const v = c < r.cells.length ? toStr(r.cells[c]) : '';
@@ -775,6 +1004,9 @@
   // 11. 导入 + 上传 + 校验
   // ============================================================
   let pendingImport = null;
+  // 防止"确认上传"被连点两次：必须与会话级的 S.busy 分开 —— 弹窗期间的 S.busy 是故意保持 true 的
+  // （用来挡住重复点「导入上传」），若用它守卫 commitImport，就会把自己的确认点击挡回去。
+  let committing = false;
 
   async function importFile(file) {
     if (S.busy) return;
@@ -821,6 +1053,10 @@
     } else {
       const s = p.merge.stats;
       html += `<div>将修改 <b>${s.mod}</b> 格 · 新增 <b>${s.add}</b> 格 · 清空 <b>${s.del}</b> 格，涉及 <b>${s.tables}</b> 张表。</div>`;
+      if (s.presetSkipped) {
+        html += `<div class="wts-warn">另有 <b>${s.presetSkipped}</b> 格是「模板预置值」（如序号列、模板里印好的参数名），
+          按约定<b>不入库</b>：页面上会靠模板自动回落显示，不需要上传。</div>`;
+      }
       if (!p.merge.changes.length) html += `<div class="wts-warn">没有检测到任何改动 —— 无需上传。</div>`;
       const byTable = new Map();
       p.merge.changes.forEach((c) => {
@@ -844,33 +1080,50 @@
     return new Promise((resolve) => {
       const modal = document.getElementById('wts-modal');
       const title = document.getElementById('wts-modal-title');
+      const okBtn = document.getElementById('wts-modal-ok');
+      const cancelBtn = document.getElementById('wts-modal-cancel');
       if (title) title.textContent = `导入预览：${filename}`;
       modal.style.display = 'flex';
+      // 按钮文案按模式设置（必须在绑定前设好，避免"点太快读到旧文案"的错觉）
+      okBtn.textContent = strictMode() ? '确认严格覆盖上传' : '确认上传改动';
+      let settled = false;
       const onOk = async () => {
-        cleanup();
-        await commitImport();
-        resolve(true);
+        if (settled) return;
+        settled = true;
+        okBtn.disabled = true;
+        cancelBtn.disabled = true;
+        okBtn.textContent = '上传中…';
+        try {
+          await commitImport();          // 注意：这里不能用 S.busy 当守门员 ——
+        } finally {                      // importFile 期间 S.busy 故意是 true
+          cleanup();
+          resolve(true);
+        }
       };
-      const onCancel = () => { cleanup(); log('warn', '已取消导入，服务器未改动。'); resolve(false); };
+      const onCancel = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        log('warn', '已取消导入，服务器未改动。');
+        resolve(false);
+      };
       function cleanup() {
         modal.style.display = 'none';
-        document.getElementById('wts-modal-ok').removeEventListener('click', onOk);
-        document.getElementById('wts-modal-cancel').removeEventListener('click', onCancel);
+        okBtn.disabled = false;
+        cancelBtn.disabled = false;
+        okBtn.removeEventListener('click', onOk);
+        cancelBtn.removeEventListener('click', onCancel);
       }
-      document.getElementById('wts-modal-ok').addEventListener('click', onOk);
-      document.getElementById('wts-modal-cancel').addEventListener('click', onCancel);
-      if (strictMode()) {
-        document.getElementById('wts-modal-ok').textContent = '确认严格覆盖上传';
-      } else {
-        document.getElementById('wts-modal-ok').textContent = '确认上传改动';
-      }
+      okBtn.addEventListener('click', onOk);
+      cancelBtn.addEventListener('click', onCancel);
     });
   }
 
   async function commitImport() {
     const p = pendingImport;
     if (!p) return;
-    if (S.busy) { log('warn', '已有操作在进行中，忽略本次重复点击。'); return; }
+    if (committing) { log('warn', '正在上传中，忽略重复点击。'); return; }
+    committing = true;
     setBusy(true);
     try {
       // 1) 备份服务器现状
@@ -880,7 +1133,7 @@
       // 2) 组装要写的表
       let tables;
       if (p.mode === 'strict') {
-        tables = buildStrictTables(p.file, p.server);
+        tables = buildStrictTables(p.file, p.server, S.defs);
         if (!tables.length) throw new Error('严格覆盖：文件里没有有效的表');
         if (!confirm(`严格覆盖会写 ${tables.length} 张表，文件里为空的格将被清空。确定继续？`)) {
           log('warn', '已放弃严格覆盖。');
@@ -888,7 +1141,7 @@
         }
       } else {
         if (!p.merge.changes.length) { log('warn', '无改动，未上传。'); return; }
-        tables = buildUploadTables(p.server, p.merge.mergedCell);
+        tables = buildUploadTables(p.server, p.merge.mergedCell, S.defs);
       }
 
       // 3) POST
@@ -930,7 +1183,7 @@
     } catch (e) {
       log('err', '上传异常：' + e.message);
       alert('上传异常：' + e.message);
-    } finally { setBusy(false); }
+    } finally { committing = false; setBusy(false); }
   }
 
   function strictMode() {
@@ -1033,7 +1286,7 @@
       <div id="wts-head">
         <span class="wts-dot"></span>
         <span>表格同步器</span>
-        <span class="wts-exp">exp ${esc(S.expId || '?')}</span>
+        <span class="wts-exp">exp ${esc(S.expId || '?')} · v${esc(scriptVersion())}</span>
         <button id="wts-toggle" title="折叠/展开">—</button>
       </div>
       <div id="wts-body">
@@ -1144,8 +1397,17 @@
   // ============================================================
   async function runDiagnostics() {
     setBusy(true);
-    log('ok', '================ 诊断开始 ================');
+    log('ok', `================ 诊断开始（脚本 v${typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version ? GM_info.script.version : '?'}）================`);
     try {
+      // 版本自检：老版本没有这些函数，一眼就能看出装的是旧脚本
+      const feats = {
+        rowCells: typeof rowCells === 'function',
+        mapLike: typeof mapLike === 'function',
+        checkDefsConsistency: typeof checkDefsConsistency === 'function',
+      };
+      log(Object.values(feats).every(Boolean) ? 'ok' : 'err',
+        `本脚本能力自检：${Object.entries(feats).map(([k, v]) => k + '=' + (v ? '有' : '缺')).join(' ')}`);
+      if (!feats.rowCells) log('err', '！！ 你在浏览器里装的是**旧版脚本**（缺 rowCells/mapLike 修复）——请重新复制本文件并覆盖旧脚本后刷新页面。');
       log('net', `页面 URL：${location.href}`);
       log('net', `URL 里的 id = ${S.expId}`);
       log('net', `SheetJS = ${getXLSX() ? '已加载 (' + (getXLSX().version || '?') + ')' : '未加载'}`);
@@ -1164,6 +1426,12 @@
         }
       }
       await loadServerData();
+      if (S.server && S.server.rawTables) {
+        S.server.rawTables.forEach((t) => {
+          const shape = t.row0IsArray ? '裸数组 [...]' : (t.row0Keys ? `对象 {${t.row0Keys.join(',')}}` : '空/未知');
+          log('net', `  服务器表 id=${t.id}：rows 是数组=${t.rowsIsArray}，第 0 行形态=${shape}`);
+        });
+      }
       const domInputs = document.querySelectorAll('#fillableDataTableEditor input.data-table-input').length;
       log('net', `弹窗 DOM 里的 input 数：${domInputs}（未打开弹窗时为 0，正常）`);
       const domDefs = scanDomInputs();
@@ -1187,7 +1455,7 @@
   async function main() {
     S.expId = getUrlParam('id');
     buildPanel();
-    log('ok', `表格同步器 v1.0.0 已加载，实验 id=${S.expId}`);
+    log('ok', `表格同步器 v${scriptVersion()} 已加载，实验 id=${S.expId}`);
     if (!/^experiment\.html/i.test(location.pathname)) {
       log('warn', '当前不是 experiment.html 页面，部分功能可能无效。');
     }
