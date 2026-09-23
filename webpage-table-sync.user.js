@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         实验数据表格 同步器（导出/导入 · 近代物理实验平台）
-// @namespace    https://github.com/nightsongs-zzp/webpage_table_Submit
-// @version      1.1.2
+// @namespace    local.experiment-table-sync
+// @version      1.2.0
 // @description  把 experiment.html?id=NN 里的 4.1 数据记录表（多张）导出为 JSON(主存档)+XLSX(方便手算)，本地改完后可安全回传：GET→三方合并→POST→回读校验，上传前自动备份，支持一键回滚。
-// @author       nightsongs-zzp
+// @author       (anonymous)
 // @match        http://119.91.120.143:8081/public/experiment.html*
 // @match        http://119.91.120.143:8081/experiment.html*
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
@@ -27,6 +27,14 @@
   const XLSX_MARK = 'webpage_table_sync/v1';
   const BASE_SHEET = '_基线';
   const PRESET_SHEET = '_预设';
+  const PRESET_LIST_SHEET = '_预置值清单';
+  // ---- 表格分区边界（导出时画出来，导入时据此截断）----
+  /** 每张表数据行的"右侧边界列"标记：不进表格数据，导入时自动剥掉 */
+  const BORDER_MARK = '\u2503';
+  /** 上/下边界横幅文案（含表 id，便于按表识别） */
+  const bannerStart = (id) => `\u25AC\u25AC\u25AC 数据区 (表 id=${id}) 开始 \u25AC\u25AC\u25AC`;
+  const bannerEnd = (id) => `\u25AC\u25AC\u25AC 数据区 (表 id=${id}) 结束（下方内容不属于表格，不会被采集）\u25AC\u25AC\u25AC`;
+  const BANNER_RE = /数据区\s*\(表\s*id\s*=\s*([^)]+)\)\s*(开始|结束)/;
   const BAK_KEY = 'wts_backup_history_v1';
   const CFG_KEY = 'wts_config_v1';
 
@@ -118,7 +126,7 @@
     return s.slice(0, 31);
   }
   function sanitizeSheetNames(pairs) {
-    const used = new Set([BASE_SHEET, PRESET_SHEET, '说明_README']);
+    const used = new Set([BASE_SHEET, PRESET_SHEET, PRESET_LIST_SHEET, '说明_README']);
     const out = [];
     for (const p of pairs) {
       let base = safeSheetName(p.name, 'T' + p.id).slice(0, 28);
@@ -145,7 +153,7 @@
     try {
       if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) return GM_info.script.version;
     } catch (e) {}
-    return '1.1.2';
+    return '1.2.0';
   }
 
   // ============================================================
@@ -508,9 +516,25 @@
     } finally { setBusy(false); }
   }
 
+  /**
+   * AOA → 工作表，并**显式显式算好 !ref**：
+   * aoa_to_sheet 只看"已有单元格"决定范围，行尾的边界列标记如果恰好都是空/undefined，
+   * 范围就会少一列，边界效果会被整列吃掉。这里按各行列数的最大值补齐并强制 !ref。
+   */
   function sheetFromAoa(aoa, widths) {
-    const ws = XLSX.utils.aoa_to_sheet(aoa, { cellDates: false });
-    ws['!cols'] = widths.map((w) => ({ wch: Math.min(40, Math.max(8, w)) }));
+    const rows = Array.isArray(aoa) ? aoa : [];
+    let maxCols = 0;
+    rows.forEach((r) => { if (Array.isArray(r) && r.length > maxCols) maxCols = r.length; });
+    const padded = rows.map((r) => {
+      const row = Array.isArray(r) ? r.slice() : [];
+      while (row.length < maxCols) row.push('');
+      return row;
+    });
+    const ws = XLSX.utils.aoa_to_sheet(padded, { cellDates: false });
+    if (rows.length && maxCols) {
+      ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rows.length - 1, c: maxCols - 1 } });
+    }
+    ws['!cols'] = (widths || []).map((w) => ({ wch: Math.min(40, Math.max(8, w)) }));
     return ws;
   }
 
@@ -533,12 +557,16 @@
         ['服务器最后更新', payload.file.serverUpdateTime || '(无)'],
         [],
         ['怎么用'],
-        ['1', '每张表一个独立工作表，表头第 1 行是表名，第 2 行是列名，第 3 行起是数据。'],
-        ['2', '直接改数据行即可；公式请填 $LaTeX$ 原文（如 $1.23\\times10^{-4}$），不要填 Excel 公式。'],
+        ['1', '每张表一个独立工作表。每张表被两条「▬▬▬ 数据区 (表 id=N) …」横幅夹住，横幅之外的内容不会被采集。'],
+        ['2', '只改两条横幅之间的数据行；公式请填 $LaTeX$ 原文（如 $1.23\\times10^{-4}$），不要填 Excel 公式。'],
         ['3', `想清空服务器上的某一格：把该格内容删成空。写 JSON 时也可以显式写 ${CLEAR_TOKEN}。`],
-        ['4', `不要改表名、列名、以及「${BASE_SHEET}」「${PRESET_SHEET}」两张工作表，否则只能按「只补空缺」方式上传。`],
+        ['4', `不要改表名、列名、行首/行尾的「${BORDER_MARK}」边界列，以及「${BASE_SHEET}」「${PRESET_SHEET}」两张工作表，否则只能按「只补空缺」方式上传。`],
         ['5', '改完回到网页，点「导入上传」，脚本会先 GET 服务器最新数据、三方合并、再 POST 覆盖你改动的格。'],
         [],
+        ['关于 Excel 公式'],
+        ['F1', '如果你在数据区里写了 Excel 公式，脚本读的是公式的【计算结果】，不会把 "=A1+B1" 这种文本上传。'],
+        ['F2', '前提是这个文件被 Excel/WPS 打开并保存过（公式结果已缓存）。若从没算过，该格会读成空并给出提醒。'],
+        ['F3', '想避免歧义，建议直接把算好的数值粘进去（可用「选择性粘贴 → 值」）。'],
         ['关于"模板预置值"（重要）'],
         ['P1', '有些格是老师模板里印好的（序号列、表4/表5 里印好的参数名等），它们在服务器上没有存过。'],
         ['P2', '这类格**永远不会被上传**：页面上靠"服务器值 → 模板预置值"的回落自动显示，不需要你填，也别指望改了能生效。'],
@@ -572,18 +600,53 @@
       wb.SheetNames.push(PRESET_SHEET);
       wb.Sheets[PRESET_SHEET] = sheetFromAoa(presetAoa, [8, 6, 6, 60]);
 
-      // ③ 每张表一个 sheet
+      // ③ 每张表一个 sheet：两面横幅 + 行尾边界列，把"表格区"框出来
       const names = sanitizeSheetNames(payload.tables.map((t) => ({
         id: t.id,
         name: `T${t.id}_${t.name || '表' + t.id}`,
       })));
       payload.tables.forEach((t, idx) => {
         const sheetName = names[idx].sheet;
-        const aoa = [[`表 id=${t.id}  ${t.name || ''}`.trim()]];
-        aoa.push(t.headers.slice());
-        t.rows.forEach((r) => aoa.push(r.cells.slice()));
+        const cols = t.headers.length;
+        const aoa = [
+          [bannerStart(t.id)],                               // ① 上边界
+          [`表 id=${t.id}  ${t.name || ''}`.trim()],          // ② 表名
+          t.headers.concat([BORDER_MARK]),                    // ③ 列名 + 行尾边界
+        ];
+        t.rows.forEach((r) => {
+          const cells = [];
+          for (let c = 0; c < cols; c++) cells.push(c < r.cells.length ? r.cells[c] : '');
+          cells.push(BORDER_MARK);                            // 行尾边界
+          aoa.push(cells);
+        });
+        aoa.push([bannerEnd(t.id)]);                          // ④ 下边界
+        aoa.push([`↑ 上面是「表 id=${t.id}」的数据区。` +
+          (idx === payload.tables.length - 1 ? '本工作表下方请勿书写内容。' : '')]);
+        const ws = sheetFromAoa(aoa, t.headers.map((h) => Math.max(String(h || '').length + 3, 11)).concat([3]));
+        // 给分区加视觉边框：横幅整条深色底 + 行尾边界列
+        const N = aoa.length;
+        const lastDataRow = N - 3;                 // 0-based：结束横幅在第 N-2 行
+        for (let c = 0; c < cols; c++) {
+          const top = XLSX.utils.encode_cell({ r: 0, c });
+          const bot = XLSX.utils.encode_cell({ r: N - 2, c });
+          if (!ws[top]) ws[top] = { t: 's', v: '' };
+          ws[top].s = { fill: { patternType: 'solid', fgColor: { rgb: 'FFD9E2F3' } }, font: { bold: true } };
+          if (!ws[bot]) ws[bot] = { t: 's', v: '' };
+          ws[bot].s = { fill: { patternType: 'solid', fgColor: { rgb: 'FFD9E2F3' } }, font: { bold: true } };
+        }
+        for (let r = 0; r < N; r++) {
+          const cell = XLSX.utils.encode_cell({ r, c: cols });
+          if (!ws[cell]) ws[cell] = { t: 's', v: '' };
+          const isBanner = (r === 0 || r === N - 2);
+          if (isBanner) {
+            ws[cell].s = { fill: { patternType: 'solid', fgColor: { rgb: 'FFD9E2F3' } }, font: { bold: true } };
+          } else {
+            ws[cell].s = { alignment: { horizontal: 'center' }, font: { color: { rgb: 'FF808080' } } };
+          }
+        }
+        ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: N - 1, c: cols } });
         wb.SheetNames.push(sheetName);
-        wb.Sheets[sheetName] = sheetFromAoa(aoa, t.headers.map((h) => Math.max(String(h || '').length + 4, 12)));
+        wb.Sheets[sheetName] = ws;
       });
       // ④ 预置值清单页：让人一眼看出"哪些格是模板自带的、永远不会被上传"
       const presetList = [['表ID', '行(从1数)', '列(从1数)', '列名', '模板预置值', '说明']];
@@ -594,8 +657,8 @@
           presetList.push([t.id, ri + 1, ci + 1, (tbl && tbl.headers[ci]) || '', toStr(c), '模板预置：改不改都不会上传']);
         }));
       });
-      wb.SheetNames.push('_预置值清单');
-      wb.Sheets['_预置值清单'] = sheetFromAoa(presetList, [8, 10, 10, 30, 30, 26]);
+      wb.SheetNames.push(PRESET_LIST_SHEET);
+      wb.Sheets[PRESET_LIST_SHEET] = sheetFromAoa(presetList, [8, 10, 10, 30, 30, 26]);
 
       const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
       const name = buildFileName('xlsx');
@@ -621,20 +684,52 @@
   // ============================================================
   // 8. 导入解析（JSON / XLSX → 统一结构）
   // ============================================================
+  /**
+   * 把一个工作表读成二维数组。
+   * **公式格取 cell.v（Excel 缓存的计算结果），不取 cell.f（公式文本）** ——
+   * 这正是"公式格只上传最终值"的实现点：SheetJS 读 xlsx 时 cell.v 就是最后一次计算的结果。
+   * 顺手统计公式格数量，便于给用户提示"我读的是结果不是公式"。
+   */
   function aoaFromSheet(XLSX, ws) {
     const ref = ws['!ref'];
-    if (!ref) return [];
+    if (!ref) return { aoa: [], formulaCells: 0 };
     const range = XLSX.utils.decode_range(ref);
     const out = [];
+    let formulaCells = 0;
     for (let R = range.s.r; R <= range.e.r; R++) {
       const row = [];
       for (let C = range.s.c; C <= range.e.c; C++) {
         const cell = ws[XLSX.utils.encode_cell({ r: R, c: C })];
+        if (cell && cell.f) formulaCells++;
         row.push(cell ? (cell.v === null || cell.v === undefined ? '' : cell.v) : '');
       }
       out.push(row);
     }
+    return { aoa: out, formulaCells };
+  }
+
+  /** 判断一行是不是分区横幅；是则返回 {id, kind:'开始'|'结束'} */
+  function bannerInfo(row) {
+    if (!Array.isArray(row)) return null;
+    for (const c of row) {
+      const m = String(c === null || c === undefined ? '' : c).match(BANNER_RE);
+      if (m) return { id: String(m[1]).trim(), kind: m[2] };
+    }
+    return null;
+  }
+
+  /** 去掉行尾的"边界列"标记；中间的标记原样保留 */
+  function stripBorderMarks(cells) {
+    const out = cells.slice();
+    while (out.length && String(out[out.length - 1]).trim() === BORDER_MARK) out.pop();
+    while (out.length && String(out[0]).trim() === BORDER_MARK) out.shift();
     return out;
+  }
+
+  /** 去掉整行全是边界列标记的情况（保留给"整行只有边界"的容错分支使用） */
+  function isBorderOnlyRow(row) {
+    if (!Array.isArray(row) || !row.length) return false;
+    return row.every((c) => { const s = String(c === null || c === undefined ? '' : c).trim(); return s === '' || s === BORDER_MARK; });
   }
 
   function normCell(v) {
@@ -658,25 +753,66 @@
       const wb = XLSX.read(arrayBuffer, { type: 'array', cellDates: false });
       const warnings = [];
       const dataSheets = wb.SheetNames.filter((n) => /^T1?_?\d+_/.test(n) || /^T\d+_/.test(n));
-      const candidates = dataSheets.length ? dataSheets : wb.SheetNames.filter((n) => n !== '说明_README' && n !== BASE_SHEET);
+      const candidates = dataSheets.length
+        ? dataSheets
+        : wb.SheetNames.filter((n) => ![ '说明_README', BASE_SHEET, PRESET_SHEET, PRESET_LIST_SHEET ].includes(n));
       const tables = [];
+      let formulaCells = 0;
       candidates.forEach((sn) => {
-        const aoa = aoaFromSheet(XLSX, wb.Sheets[sn]);
+        const parsedSheet = aoaFromSheet(XLSX, wb.Sheets[sn]);
+        let aoa = parsedSheet.aoa;
+        formulaCells += parsedSheet.formulaCells;
         let id = null;
         const m = sn.match(/^T(\d+)_/);
         if (m) id = parseInt(m[1], 10);
-        if (id === null && aoa[0] && aoa[0][0] !== undefined) {
-          const m2 = String(aoa[0][0]).match(/id\s*=\s*(\d+)/);
+
+        // ---- 定位表格区：横幅 > 表名 > 列名 > 数据…（读不到横幅就按老格式从第 1 行起）----
+        let firstRow = 0, lastRow = aoa.length - 1;
+        const banners = [];
+        aoa.forEach((row, i) => { const b = bannerInfo(row); if (b) banners.push(Object.assign({ idx: i }, b)); });
+        const startBanner = banners.find((b) => b.kind === '开始' && (id === null || String(b.id) === String(id)));
+        const endBanner = banners.find((b) => b.kind === '结束' && (id === null || String(b.id) === String(id)));
+        if (startBanner) firstRow = startBanner.idx + 1;
+        if (endBanner) lastRow = endBanner.idx - 1;
+        if (startBanner && id === null) id = /^\d+$/.test(startBanner.id) ? parseInt(startBanner.id, 10) : startBanner.id;
+        if (id === null && aoa[firstRow] && aoa[firstRow][0] !== undefined) {
+          const m2 = String(aoa[firstRow][0]).match(/id\s*=\s*(\d+)/);
           if (m2) id = parseInt(m2[1], 10);
         }
         if (id === null) { warnings.push(`工作表「${sn}」认不出表 id，已跳过`); return; }
-        const headers = (aoa[1] || []).map(normCell);
-        const rows = aoa.slice(2).map((r) => ({ cells: r.map(normCell) }));
-        tables.push({ id, name: '', headers, rows });
+
+        // 表名行（可选）
+        let name = '';
+        const nameRow = aoa[firstRow];
+        if (nameRow && nameRow.length) {
+          const joined = nameRow.map((c) => String(c === null || c === undefined ? '' : c)).join(' ').trim();
+          if (/表\s*id\s*=/.test(joined) || (joined && !nameRow.slice(1).some((c) => String(c || '').trim() !== ''))) {
+            name = joined.replace(/^表\s*id\s*=\s*\S+\s*/, '').trim();
+            firstRow += 1;
+          }
+        }
+        const headers = stripBorderMarks((aoa[firstRow] || []).map(normCell));
+        const rows = [];
+        for (let i = firstRow + 1; i <= lastRow && i < aoa.length; i++) {
+          const raw = aoa[i];
+          if (bannerInfo(raw)) break;                    // 撞到横幅就停（横幅之间才是数据）
+          // ⚠ 行号 = 数据集里的 row 索引，**一行都不能丢**（丢了会让后面整列错位、被误判成"清空"）。
+          // 空白行也照样保留成 {"cells":["","",…]}，合并时它与服务器空值一致，不会产生任何改动。
+          rows.push({ cells: stripBorderMarks(raw.map(normCell)) });
+        }
+        if (!headers.length || !headers.some((h) => h)) {
+          warnings.push(`工作表「${sn}」没读到列名（横幅/表名行是不是被删了？），已跳过`);
+          return;
+        }
+        tables.push({ id, name, headers, rows });
       });
+      if (formulaCells) {
+        warnings.push(`表里有 ${formulaCells} 个 Excel 公式格：已按【公式计算结果】读取，不会上传公式文本。` +
+          `（若某格显示为空，说明该文件没被 Excel/WPS 保存过、公式结果还没算出来）`);
+      }
       let baseline = null;
       if (wb.Sheets[BASE_SHEET]) {
-        const b = aoaFromSheet(XLSX, wb.Sheets[BASE_SHEET]);
+        const b = aoaFromSheet(XLSX, wb.Sheets[BASE_SHEET]).aoa;
         baseline = new Map();
         b.slice(1).forEach((r) => {
           if (r.length < 4) return;
@@ -691,7 +827,7 @@
       }
       let presets = null;
       if (wb.Sheets[PRESET_SHEET]) {
-        const b = aoaFromSheet(XLSX, wb.Sheets[PRESET_SHEET]);
+        const b = aoaFromSheet(XLSX, wb.Sheets[PRESET_SHEET]).aoa;
         presets = new Map();
         b.slice(1).forEach((r) => {
           if (r.length < 4) return;

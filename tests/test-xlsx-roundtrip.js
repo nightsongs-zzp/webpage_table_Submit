@@ -15,7 +15,7 @@ const SRC = path.join(__dirname, '..', 'webpage-table-sync.user.js');
 const src = fs.readFileSync(SRC, 'utf8');
 const marker = 'if (document.readyState === \'loading\')';
 const cut = src.indexOf(marker);
-const body = src.slice(0, cut) + '\nreturn { parseFileToPayload, computeMerge, buildUploadTables, cellKey, normCell, CLEAR_TOKEN, sanitizeSheetNames, PRESET_SHEET, BASE_SHEET };\n})();';
+const body = src.slice(0, cut) + '\nreturn { parseFileToPayload, computeMerge, buildUploadTables, cellKey, normCell, CLEAR_TOKEN, sanitizeSheetNames, PRESET_SHEET, BASE_SHEET, BORDER_MARK };\n})();';
 
 function makeEl() {
   return {
@@ -28,8 +28,8 @@ function makeEl() {
 const sandbox = {
   console, XLSX,
   document: { readyState: 'complete', head: makeEl(), body: makeEl(), createElement: () => makeEl(), getElementById: () => null, querySelector: () => null, querySelectorAll: () => [], addEventListener() {} },
-  window: { location: { href: 'http://x/public/experiment.html?id=33', search: '?id=33', pathname: '/public/experiment.html', host: '119.91.120.143:8081' }, addEventListener() {}, innerWidth: 1200, innerHeight: 800 },
-  location: { href: 'http://x/public/experiment.html?id=33', search: '?id=33', pathname: '/public/experiment.html', host: '119.91.120.143:8081' },
+  window: { location: { href: 'http://test-host/public/experiment.html?id=33', search: '?id=33', pathname: '/public/experiment.html', host: 'test-host' }, addEventListener() {}, innerWidth: 1200, innerHeight: 800 },
+  location: { href: 'http://test-host/public/experiment.html?id=33', search: '?id=33', pathname: '/public/experiment.html', host: 'test-host' },
   localStorage: { _d: {}, getItem(k) { return this._d[k] === undefined ? null : this._d[k]; }, setItem(k, v) { this._d[k] = String(v); }, removeItem(k) { delete this._d[k]; } },
   URL: { createObjectURL: () => 'blob:x', revokeObjectURL() {} }, Blob: function () {},
   alert: () => {}, confirm: () => true, prompt: () => '1',
@@ -45,6 +45,10 @@ function eq(name, actual, expect) {
   const a = JSON.stringify(actual), e = JSON.stringify(expect);
   if (a === e) { pass++; console.log('  ✓ ' + name); }
   else { fail++; console.log(`  ✗ ${name}   → actual=${a} expect=${e}`); }
+}
+function ok(name, cond, extra) {
+  if (cond) { pass++; console.log('  ✓ ' + name); }
+  else { fail++; console.log('  ✗ ' + name + (extra ? '  → ' + extra : '')); }
 }
 
 // ---------- 造 payload（等价于真实导出：5 张表，列数 6/11/7/8/5） ----------
@@ -71,7 +75,12 @@ const baseline = tables.map((t) => ({ id: t.id, name: t.name, headers: t.headers
 
 // ---------- 用与 exportXLSX 相同的结构写工作簿 ----------
 const sheetFromAoa = (aoa, widths) => {
-  const ws = XLSX.utils.aoa_to_sheet(aoa, { cellDates: false });
+  const rows = Array.isArray(aoa) ? aoa : [];
+  let maxCols = 0;
+  rows.forEach((r) => { if (Array.isArray(r) && r.length > maxCols) maxCols = r.length; });
+  const padded = rows.map((r) => { const row = Array.isArray(r) ? r.slice() : []; while (row.length < maxCols) row.push(''); return row; });
+  const ws = XLSX.utils.aoa_to_sheet(padded, { cellDates: false });
+  if (rows.length && maxCols) ws['!ref'] = XLSX.utils.encode_range({ s: { r: 0, c: 0 }, e: { r: rows.length - 1, c: maxCols - 1 } });
   ws['!cols'] = widths.map((w) => ({ wch: Math.min(40, Math.max(8, w)) }));
   return ws;
 };
@@ -88,13 +97,28 @@ tables.forEach((t) => t.rows.forEach((r, ri) => r.cells.forEach((c, ci) => prese
 wb.SheetNames.push(fns.PRESET_SHEET);
 wb.Sheets[fns.PRESET_SHEET] = sheetFromAoa(presetAoa, [8, 6, 6, 60]);
 const names = fns.sanitizeSheetNames(tables.map((t) => ({ id: t.id, name: `T${t.id}_${t.name || '表' + t.id}` })));
+const BORDER = fns.BORDER_MARK;
+const bStart = (id) => `\u25AC\u25AC\u25AC 数据区 (表 id=${id}) 开始 \u25AC\u25AC\u25AC`;
+const bEnd = (id) => `\u25AC\u25AC\u25AC 数据区 (表 id=${id}) 结束\u25AC\u25AC\u25AC`;
+/** 与脚本 exportXLSX 完全一致的表页结构：上横幅 / 表名 / 列名+边界列 / 数据+边界列 / 下横幅 / 提示行 */
+const dataRows = [];
 tables.forEach((t, idx) => {
-  const aoa = [[`表 id=${t.id}  ${t.name || ''}`.trim()]];
-  aoa.push(t.headers.slice());
-  t.rows.forEach((r) => aoa.push(r.cells.slice()));
+  const cols = t.headers.length;
+  const aoa = [[bStart(t.id)], [`表 id=${t.id}  ${t.name || ''}`.trim()], t.headers.concat([BORDER])];
+  t.rows.forEach((r) => {
+    const cells = [];
+    for (let c = 0; c < cols; c++) cells.push(c < r.cells.length ? r.cells[c] : '');
+    cells.push(BORDER);
+    aoa.push(cells);
+  });
+  aoa.push([bEnd(t.id)]);
+  aoa.push([`↑ 上面是「表 id=${t.id}」的数据区。`]);
+  dataRows.push(aoa);
   wb.SheetNames.push(names[idx].sheet);
-  wb.Sheets[names[idx].sheet] = sheetFromAoa(aoa, t.headers.map((h) => Math.max(String(h || '').length + 4, 12)));
+  wb.Sheets[names[idx].sheet] = sheetFromAoa(aoa, t.headers.map((h) => Math.max(String(h || '').length + 3, 11)).concat([3]));
 });
+// Excel 行号：上横幅=1，表名=2，列名=3，数据从第 4 行起
+const FIRST_DATA_EXCEL_ROW = 4;
 const buf = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
 const tmp = path.join(os.tmpdir(), 'wts-roundtrip.xlsx');
 fs.writeFileSync(tmp, Buffer.from(buf));
@@ -105,8 +129,10 @@ const modified = XLSX.read(buf, { type: 'array', cellDates: false });
 {
   const sn = names[0].sheet;
   const ws = modified.Sheets[sn];
-  ws['B5'] = { t: 's', v: '$9.99\\times10^{-9}$' };  // 数据第 3 行（0-based r=2）第 2 列（c=1）→ Excel 第 5 行
-  delete ws['A5'];                                    // 数据第 3 行第 1 列（r=2,c=0，值 1800）删空 → 视为清空
+  // 数据第 3 行（0-based r=2）→ Excel 第 4+2 = 6 行
+  const excelRow = FIRST_DATA_EXCEL_ROW + 2;
+  ws['B' + excelRow] = { t: 's', v: '$9.99\\times10^{-9}$' };  // 改成新值
+  delete ws['A' + excelRow];                                    // 第 1 列删空 → 视为清空
   modified.Sheets[sn] = ws;
 }
 const buf2 = XLSX.write(modified, { bookType: 'xlsx', type: 'array', compression: true });
@@ -118,13 +144,25 @@ console.log('=== A. 原样读回（未改动） ===');
   eq('识别 2 张表', p.tables.length, 2);
   eq('表 id 从工作表名还原', p.tables.map((t) => t.id), [0, 1]);
   eq('表头无损（含 LaTeX 与 $ 符号）', p.tables[0].headers[1], '灯丝电流 $I_f$ (A)');
-  eq('行数正确', p.tables.map((t) => t.rows.length), [7, 6]);
+  // 关键：即使数据行全空，也必须原样回来（靠行尾边界列撑住，否则 Excel 会整行省略 → 导入时误判删除）
+  if (JSON.stringify(p.tables.map((t) => t.rows.length)) !== '[7,6]') {
+    const rx = XLSX.read(Buffer.from(buf), { type: 'array' });
+    const wsx = rx.Sheets[names[0].sheet];
+    console.log('  [dbg] !ref=' + wsx['!ref'] + ' 造表行数=' + dataRows[0].length);
+    for (let i = 3; i < dataRows[0].length; i++) {
+      const aoa = XLSX.utils.sheet_to_json(wsx, { header: 1, defval: '<空>', blankrows: true });
+      console.log(`  [dbg] 行${i + 1} 写的是 ${JSON.stringify(dataRows[0][i])} → 读回 ${JSON.stringify(aoa[i])}`);
+    }
+  }
+  eq('行数正确（含末尾空行，一列不少）', p.tables.map((t) => t.rows.length), [7, 6]);
+  eq('空行内容为空而不是缺失', p.tables[0].rows[6].cells, ['', '', '', '', '', '']);
   eq('列数正确', p.tables.map((t) => t.headers.length), [6, 4]);
   eq('LaTeX 单元格无损', p.tables[0].rows[1].cells[0], '$1.5\\times10^{-4}$');
   eq('含 | 与 , 的单元格无损', p.tables[0].rows[3].cells[0], 'x|y,z 空格 结尾 ');
   eq('带出基线', !!p.baseline, true);
   eq('带出预设层', !!p.presets, true);
   eq('预设层内容正确（第1行第1列=1）', p.presets.get(fns.cellKey(0, 0, 0)), '1');
+  ok('行尾边界列已被剥掉（不应出现在数据里）', !JSON.stringify(p.tables).includes(BORDER), '还有 ' + BORDER + ' 残留');
   const server = { tables: JSON.parse(JSON.stringify(tables)), update_time: 't' };
   const m = fns.computeMerge(p, server);
   console.log(`     （数字/文本还原：[1800]=${JSON.stringify(p.tables[0].rows[2].cells[0])}, [0.00015]=${JSON.stringify(p.tables[0].rows[2].cells[1])}, [007]=${JSON.stringify(p.tables[0].rows[2].cells[2])}）`);

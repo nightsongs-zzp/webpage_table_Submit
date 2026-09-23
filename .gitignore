@@ -9,7 +9,10 @@ data/
 node_modules/
 
 # 含登录 cookie、服务器地址、接口细节的本地抓包笔记——不要推到 GitHub
-# （认证信息.txt / 抓接口.txt / view-source_*.html 已于本次取消跟踪；本地文件仍在，只是不再提交）
+# （认证信息.txt / 抓接口.txt / view-source_*.html 已从工作区删除并从索引移除；
+#   下面保留规则，防止以后新抓的同类文件被误提交）
 网页信息/认证信息.txt
 网页信息/抓接口.txt
 网页信息/view-source_*.html
+网页信息/抓包*/
+*.har

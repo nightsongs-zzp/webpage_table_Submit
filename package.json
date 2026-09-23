@@ -1,11 +1,12 @@
 {
   "name": "webpage-table-submit-tools",
   "private": true,
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "近代物理实验平台：数据记录表抓取/回传的油猴脚本 + 合并逻辑离线自测",
   "scripts": {
-    "test": "node tests/test-merge.js && node tests/test-xlsx-roundtrip.js && node tests/test-export-integration.js && node tests/test-ui-flow.js",
+    "test": "node tests/test-merge.js && node tests/test-xlsx-roundtrip.js && node tests/test-boundary-formula.js && node tests/test-export-integration.js && node tests/test-ui-flow.js",
     "test:ui": "node tests/test-ui-flow.js",
+    "scan:privacy": "node tests/scan-personal.js",
     "repro": "node tests/repro-import.js",
     "inspect": "node tests/inspect-file.js"
   },
