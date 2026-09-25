@@ -44,6 +44,7 @@
     defsSource: '',
     defRowsById: new Map(), // id → 模板预置行（学生没填时页面显示的兜底值）
     server: null,        // { tables:[{id,name,headers,rows}], table_data:{...}, update_time }
+    expData: null,       // /api/experiment/{id} 的完整返回（正文到处都要用）
     lastResponse: null,  // 上次 POST 的响应
     busy: false,
     logLines: [],
@@ -668,6 +669,353 @@
     } catch (e) {
       log('err', '导出 XLSX 失败：' + e.message);
       alert('导出 XLSX 失败：' + e.message);
+    } finally { setBusy(false); }
+  }
+
+  // ============================================================
+  // 7.5 网页正文导出（表格之外的所有文字）
+  // ============================================================
+  /** 正文分区：字段名 → 章节标题（顺序即文档顺序；表格相关字段**不含**在这里） */
+  const TEXT_SECTIONS = [
+    ['__basic', '实验基本信息'],
+    ['core_knowledge', '核心知识点'],
+    ['pre_knowledge', '前置知识要求'],
+    ['preview_question', '预习思考题'],
+    ['target_content', '实验目的'],
+    ['principle_content', '实验原理'],
+    ['equipment_table', '实验器材'],
+    ['safety_content', '安全注意事项'],
+    ['operation_flow', '操作步骤 / 流程'],
+    ['operation_tips', '操作要点与注意事项'],
+    ['error_analysis', '误差分析'],
+    ['result_require', '结果要求'],
+    ['after_question', '课后思考题'],
+    ['expand_content', '拓展应用'],
+    ['test_bank', '自测题库'],
+  ];
+  // 这些字段属于"表格数据"，由数据记录表功能负责，正文导出里跳过
+  const TEXT_SKIP_FIELDS = new Set(['data_table', 'data_calc', 'dataTableDefinition', 'data_table_definition']);
+
+  /** 让 HTML 变成好读的 Markdown（只处理正文里实际出现的语法，够用且不会乱） */
+  function htmlToMarkdown(root) {
+    if (!root) return '';
+    const out = [];
+    const kids = (n) => Array.prototype.slice.call(n.childNodes || []);
+
+    function inline(n) {
+      let s = '';
+      kids(n).forEach((c) => {
+        if (c.nodeType === 3) { s += String(c.nodeValue || '').replace(/\s+/g, ' '); return; }
+        if (c.nodeType !== 1) return;
+        const t = c.tagName;
+        if (t === 'BR') { s += '  \n'; return; }
+        if (t === 'STRONG' || t === 'B') { s += '**' + inline(c).trim() + '**'; return; }
+        if (t === 'EM' || t === 'I') { s += '*' + inline(c).trim() + '*'; return; }
+        if (t === 'CODE') { s += '`' + inline(c).trim() + '`'; return; }
+        if (t === 'A') {
+          const href = c.getAttribute && c.getAttribute('href');
+          const txt = inline(c).trim();
+          s += (href && !/^javascript:/i.test(href)) ? `[${txt}](${href})` : txt;
+          return;
+        }
+        if (t === 'IMG') {
+          const src = (c.getAttribute && (c.getAttribute('src') || c.getAttribute('data-src'))) || '';
+          const alt = (c.getAttribute && c.getAttribute('alt')) || '图片';
+          s += src ? `![${alt}](${src})` : '';
+          return;
+        }
+        if (t === 'SVG' || t === 'STYLE' || t === 'SCRIPT') return;
+        s += inline(c);
+      });
+      return s;
+    }
+
+    function list(n, depth, ordered) {
+      kids(n).forEach((li) => {
+        if (li.nodeType !== 1 || li.tagName !== 'LI') return;
+        const nested = [];
+        const parts = [];
+        kids(li).forEach((c) => {
+          if (c.nodeType === 1 && (c.tagName === 'UL' || c.tagName === 'OL')) { nested.push(c); return; }
+          parts.push(c.nodeType === 3 ? String(c.nodeValue || '') : (c.nodeType === 1 ? inline(c) : ''));
+        });
+        const txt = parts.join('').replace(/\s+/g, ' ').trim();
+        const indent = '  '.repeat(depth);
+        if (ordered) {
+          const idx = Array.prototype.indexOf.call(n.children || [], li) + 1;
+          out.push(`${indent}${idx}. ${txt}`);
+        } else {
+          out.push(`${indent}- ${txt}`);
+        }
+        nested.forEach((sub) => list(sub, depth + 1, sub.tagName === 'OL'));
+      });
+    }
+
+    function walk(n, depth) {
+      kids(n).forEach((c) => {
+        if (c.nodeType === 3) {
+          const t = String(c.nodeValue || '').replace(/\s+/g, ' ').trim();
+          if (t) out.push(t);
+          return;
+        }
+        if (c.nodeType !== 1) return;
+        const t = c.tagName;
+        if (t === 'SCRIPT' || t === 'STYLE') return;
+        if (/^H[1-6]$/.test(t)) {
+          const lvl = Math.min(4, Math.max(2, Number(t[1]) + 1)); // h1→##（文档已用 # 作标题）
+          out.push('\n' + '#'.repeat(lvl) + ' ' + inline(c).trim() + '\n');
+          return;
+        }
+        if (t === 'P') { const x = inline(c).trim(); if (x) out.push('\n' + x + '\n'); return; }
+        if (t === 'UL' || t === 'OL') { out.push(''); list(c, depth, t === 'OL'); out.push(''); return; }
+        if (t === 'TABLE') { out.push('', tableToMarkdown(c), ''); return; }
+        if (t === 'BLOCKQUOTE') { out.push('\n> ' + inline(c).trim().replace(/\n+/g, '\n> ') + '\n'); return; }
+        if (t === 'PRE') { out.push('\n```\n' + (c.textContent || '').replace(/\n+$/, '') + '\n```\n'); return; }
+        if (t === 'HR') { out.push('\n---\n'); return; }
+        if (t === 'DIV' || t === 'SECTION' || t === 'ARTICLE' || t === 'BODY' || t === 'FIGURE' || t === 'FIGCAPTION') {
+          walk(c, depth);
+          return;
+        }
+        const x = inline(c).trim();
+        if (x) out.push('\n' + x + '\n');
+      });
+    }
+
+    function tableToMarkdown(tb) {
+      const rows = [];
+      Array.prototype.slice.call(tb.querySelectorAll ? tb.querySelectorAll('tr') : []).forEach((tr) => {
+        const cells = Array.prototype.slice.call(tr.children || [])
+          .filter((c) => c.tagName === 'TD' || c.tagName === 'TH')
+          .map((c) => inline(c).replace(/\|/g, '\\|').replace(/\s+/g, ' ').trim());
+        if (cells.length) rows.push(cells);
+      });
+      if (!rows.length) return '';
+      const head = rows[0];
+      const lines = ['| ' + head.join(' | ') + ' |', '| ' + head.map(() => '---').join(' | ') + ' |'];
+      rows.slice(1).forEach((r) => {
+        const pad = head.map((_, i) => (r[i] === undefined ? '' : r[i]));
+        lines.push('| ' + pad.join(' | ') + ' |');
+      });
+      return lines.join('\n');
+    }
+
+    walk(root, 0);
+    return out.join('\n')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/^\n+/, '')
+      .trim();
+  }
+
+  /** 把一段原始内容（可能是 HTML，也可能是 markdown 原文）转成 Markdown */
+  function contentToMarkdown(raw) {
+    const s = toStr(raw).trim();
+    if (!s) return '';
+    if (!/<[a-z][\s\S]*>/i.test(s)) return s;            // 本来就是 markdown/纯文本，原样保留
+    try {
+      const doc = new DOMParser().parseFromString('<div id="wts-root">' + s + '</div>', 'text/html');
+      const root = doc.getElementById('wts-root') || doc.body;
+      return htmlToMarkdown(root) || s;
+    } catch (e) {
+      return s;
+    }
+  }
+
+  /** Markdown → 纯文本（去掉标记，公式仅保留内部文本），便于贴进 Word / 记事本 */
+  function markdownToPlain(md) {
+    return toStr(md)
+      .replace(/\$\$([\s\S]*?)\$\$/g, (m, x) => ' ' + x.replace(/\\[a-zA-Z]+|[{}]/g, ' ').replace(/\s+/g, ' ').trim() + ' ')
+      .replace(/\$([^$\n]+?)\$/g, (m, x) => x.replace(/\\[a-zA-Z]+|[{}]/g, ' ').replace(/\s+/g, ' ').trim())
+      .replace(/!\[[^\]]*\]\([^)]*\)/g, '')
+      .replace(/\[([^\]]*)\]\(([^)]*)\)/g, '$1 ($2)')
+      .replace(/^#{1,6}\s*/gm, '')
+      .replace(/\*\*([^*]+)\*\*/g, '$1')
+      .replace(/(^|\s)\*([^*]+)\*/g, '$1$2')
+      .replace(/`([^`]+)`/g, '$1')
+      .replace(/^\s*\|/gm, '  ')
+      .replace(/^[\s|:-]+$/gm, '')
+      .replace(/[ \t]+\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  /** 组装整篇正文文档（Markdown） */
+  function buildTextDoc() {
+    const exp = S.expData;
+    if (!exp) return null;
+    const basic = [
+      `- **实验名称**：${toStr(exp.name) || '-'}`,
+      `- **所属分类**：${toStr(exp.category_name) || '-'}`,
+      `- **难度**：${toStr(exp.difficulty) || '-'}`,
+      `- **建议学时**：${toStr(exp.period) || '-'}`,
+      exp.virtualLabUrl ? `- **虚拟实验**：${toStr(exp.virtualLabUrl)}` : '',
+    ].filter(Boolean).join('\n');
+
+    const parts = [];
+    parts.push(`# ${toStr(exp.name) || '实验内容'}（实验 id=${S.expId}）`);
+    parts.push(`> 从实验平台网页导出 · ${new Date().toLocaleString()} · 来源：${location.host}`);
+    parts.push(`> 本文件只含**表格之外**的文字内容；数据记录表请在「表格同步器」里用导出 JSON/XLSX。`);
+
+    const toc = [];
+    const bodies = [];
+    TEXT_SECTIONS.forEach(([key, title], i) => {
+      const md = key === '__basic' ? basic : contentToMarkdown(exp[key]);
+      if (!md) return;
+      toc.push(`${toc.length + 1}. ${title}`);
+      bodies.push(`\n---\n\n## ${title}\n\n${md}`);
+    });
+    // 补一句：如果模板把表格说明写在 data_table / data_calc 里，也给它留个索引
+    const tableish = ['data_table', 'data_calc']
+      .map((k) => contentToMarkdown(exp[k]))
+      .filter((x) => x);
+    if (tableish.length) {
+      toc.push(`${toc.length + 1}. 数据记录与数据处理（表格，见网页）`);
+      bodies.push(`\n---\n\n## 数据记录与数据处理（表格，见网页）\n\n` +
+        `> 这部分是**表格类**内容，本文件只保留其文字说明；填写与回传请用「表格同步器」。\n\n` +
+        tableish.join('\n\n'));
+    }
+    if (!bodies.length) return null;
+
+    const empty = TEXT_SECTIONS.filter(([k]) => k !== '__basic' && !contentToMarkdown(exp[k])).map(([, t]) => t);
+    const doc = [
+      parts.join('\n'),
+      '\n## 目录\n\n' + toc.join('\n'),
+      bodies.join('\n'),
+      empty.length ? `\n---\n\n> 以下章节本次为空（模板未填写）：${empty.join('、')}\n` : '',
+      `\n---\n\n*本文件由「表格同步器」正文导出生成；公式为 LaTeX 原文，可直接粘进支持 LaTeX 的编辑器。*\n`,
+    ].join('\n');
+    return { markdown: doc, name: toStr(exp.name) || 'experiment', sectionCount: toc.length, emptySections: empty };
+  }
+
+  /** 把 Markdown 变成可离线阅读的 HTML（自带极简渲染 + KaTeX 公式） */
+  function markdownToReadableHtml(md, title) {
+    const esc0 = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const math = [];
+    // 先把公式抽出来（避免被 markdown 规则误伤），行间公式优先
+    let t = md.replace(/\$\$([\s\S]+?)\$\$/g, (m, x) => { math.push({ x, d: true }); return `\uE000${math.length - 1}\uE001`; });
+    t = t.replace(/\$([^$\n]+?)\$/g, (m, x) => { math.push({ x, d: false }); return `\uE000${math.length - 1}\uE001`; });
+
+    // ⚠ 不要在识别结构之前整段转义：`> 引用` 会被转成 `&gt; 引用`，引用块就再也认不出来了。
+    // 正确做法：结构识别用**原文**，每个渲染点（标题/列表/单元格/段落）各自调 inline() 做转义。
+    const inline = (s) => {
+      let x = esc0(s);
+      x = x.replace(/`([^`]+)`/g, '\uE002$1\uE003');                        // 行内代码先占位，避免被加粗规则吃掉
+      x = x.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      x = x.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+      x = x.replace(/\uE002([^\uE003]*)\uE003/g, '<code>$1</code>');
+      x = x.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img alt="$1" src="$2">');
+      x = x.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+      return x;
+    };
+
+    const lines = t.split('\n');
+    const html = [];
+    let inUl = false, inOl = false, inCode = false, inTable = false;
+    const closeLists = () => {
+      if (inUl) { html.push('</ul>'); inUl = false; }
+      if (inOl) { html.push('</ol>'); inOl = false; }
+    };
+    const closeTable = () => { if (inTable) { html.push('</table>'); inTable = false; } };
+
+    lines.forEach((line) => {
+      if (/^```/.test(line)) {
+        closeLists(); closeTable();
+        html.push(inCode ? '</code></pre>' : '<pre><code>');
+        inCode = !inCode;
+        return;
+      }
+      if (inCode) { html.push(line); return; }
+      const h = line.match(/^(#{1,6})\s+(.*)$/);
+      if (h) { closeLists(); closeTable(); html.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); return; }
+      if (/^\s*\|/.test(line)) {
+        if (/^\s*\|[\s:|-]+\|\s*$/.test(line)) return;   // 表格分隔行
+        if (!inTable) { closeLists(); html.push('<table>'); inTable = true; }
+        const cells = line.trim().replace(/^\||\|$/g, '').split('|');
+        html.push('<tr>' + cells.map((c) => `<td>${inline(c.trim())}</td>`).join('') + '</tr>');
+        return;
+      }
+      closeTable();
+      if (/^>\s?/.test(line)) { closeLists(); html.push(`<blockquote>${inline(line.replace(/^>\s?/, ''))}</blockquote>`); return; }
+      if (/^---+\s*$/.test(line)) { closeLists(); html.push('<hr>'); return; }
+      const ul = line.match(/^(\s*)-\s+(.*)$/);
+      if (ul) { if (inOl) { html.push('</ol>'); inOl = false; } if (!inUl) { html.push('<ul>'); inUl = true; } html.push(`<li>${inline(ul[2])}</li>`); return; }
+      const ol = line.match(/^(\s*)\d+\.\s+(.*)$/);
+      if (ol) { if (inUl) { html.push('</ul>'); inUl = false; } if (!inOl) { html.push('<ol>'); inOl = true; } html.push(`<li>${inline(ol[2])}</li>`); return; }
+      closeLists();
+      if (!line.trim()) return;
+      html.push(`<p>${inline(line)}</p>`);
+    });
+    closeLists();
+    closeTable();
+    let body = html.join('\n');
+    math.forEach((m, i) => {
+      const rendered = (typeof katex !== 'undefined' && katex && typeof katex.renderToString === 'function')
+        ? katex.renderToString(m.x, { throwOnError: false, displayMode: m.d })
+        : esc0((m.d ? '$$' : '$') + m.x + (m.d ? '$$' : '$'));
+      body = body.split(`\uE000${i}\uE001`).join(rendered);
+    });
+    return `<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc0(title)}</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+<style>
+ body{max-width:900px;margin:40px auto;padding:0 20px;line-height:1.75;color:#1f2937;
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Microsoft YaHei",serif;}
+ h1{border-bottom:3px solid #165DFF;padding-bottom:10px;}
+ h2{margin-top:2em;color:#0E2B5C;border-left:5px solid #165DFF;padding-left:10px;}
+ h3{color:#0E2B5C;} hr{border:0;border-top:1px dashed #cbd5e1;margin:2em 0;}
+ table{border-collapse:collapse;width:100%;margin:1em 0;}
+ td,th{border:1px solid #cbd5e1;padding:6px 10px;} tr:first-child{background:#f1f5f9;font-weight:600;}
+ blockquote{margin:1em 0;padding:.5em 1em;background:#f8fafc;border-left:4px solid #94a3b8;color:#475569;}
+ code{background:#f1f5f9;padding:2px 5px;border-radius:4px;font-size:.92em;}
+ pre{background:#0f172a;color:#e2e8f0;padding:12px;border-radius:8px;overflow:auto;}
+ img{max-width:100%;} ol,ul{padding-left:1.6em;}
+ @media print{body{max-width:none;margin:0;} h2{break-after:avoid;}}
+</style></head>
+<body>
+${body}
+</body></html>`;
+  }
+
+  async function loadExpData(force) {
+    if (S.expData && !force) return S.expData;
+    const r = await api('GET', API_EXPERIMENT(S.expId));
+    if (r.json && r.json.code === 1 && r.json.data) { S.expData = r.json.data; return S.expData; }
+    throw new Error(`读取实验内容失败：HTTP ${r.status} code=${r.json && r.json.code}`);
+  }
+
+  async function exportText(kind) {
+    if (S.busy) return; setBusy(true);
+    try {
+      await loadExpData(true);
+      const doc = buildTextDoc();
+      if (!doc) throw new Error('这个实验没有可导出的正文内容');
+      if (kind === 'clip') {
+        const plainElse = markdownToPlain(doc.markdown);
+        if (typeof GM_setClipboard === 'function') { GM_setClipboard(doc.markdown, 'text'); log('ok', `已把正文（${doc.sectionCount} 个章节，${doc.markdown.length} 字）复制到剪贴板（Markdown 原文）`); alert('正文已复制到剪贴板（Markdown 格式）。'); }
+        else { console.log(plainElse); alert('本环境不支持直接写剪贴板，已把纯文本打印到控制台。'); }
+        return;
+      }
+      const base = `${filePrefix()}正文_${timestamp()}`;
+      if (kind === 'md') {
+        const name = `${base}.md`;
+        downloadBlob(new Blob(['\uFEFF' + doc.markdown], { type: 'text/markdown;charset=utf-8' }), name);
+        log('ok', `已导出 ${name}（${doc.sectionCount} 个章节 / ${doc.markdown.length} 字）`);
+      } else if (kind === 'txt') {
+        const name = `${base}.txt`;
+        downloadBlob(new Blob(['\uFEFF' + markdownToPlain(doc.markdown)], { type: 'text/plain;charset=utf-8' }), name);
+        log('ok', `已导出 ${name}（纯文本，已去掉 Markdown 标记）`);
+      } else if (kind === 'html') {
+        const name = `${base}.html`;
+        const html = markdownToReadableHtml(doc.markdown, doc.name);
+        downloadBlob(new Blob([html], { type: 'text/html;charset=utf-8' }), name);
+        log('ok', `已导出 ${name}（可离线阅读，公式用 KaTeX 渲染）`);
+      }
+      if (doc.emptySections.length) log('warn', `以下章节本次为空（模板未填写）：${doc.emptySections.join('、')}`);
+    } catch (e) {
+      log('err', '正文导出失败：' + e.message);
+      alert('正文导出失败：' + e.message);
     } finally { setBusy(false); }
   }
 
@@ -1352,6 +1700,8 @@
   .wts-row button.wts-primary:hover { background: #1249c9; }
   .wts-row button.wts-danger { color: #b91c1c; border-color: #fca5a5; background: #fef2f2; }
   .wts-row button:disabled { opacity: .5; cursor: not-allowed; }
+  .wts-sep { margin: 10px 0 6px; padding-top: 8px; border-top: 1px dashed #cbd5e1;
+    font-size: 11.5px; color: #64748b; }
   #wts-summary { font-size: 12px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px; margin-bottom: 8px; }
   #wts-summary table { border-collapse: collapse; width: 100%; }
   #wts-summary td, #wts-summary th { border-bottom: 1px solid #e5e7eb; padding: 2px 4px; text-align: left; font-size: 11.5px; }
@@ -1391,7 +1741,8 @@
 
   function setBusy(b) {
     S.busy = b;
-    ['wts-btn-json', 'wts-btn-xlsx', 'wts-btn-import', 'wts-btn-refresh', 'wts-btn-rollback'].forEach((id) => {
+    ['wts-btn-json', 'wts-btn-xlsx', 'wts-btn-import', 'wts-btn-refresh', 'wts-btn-rollback',
+      'wts-btn-text-md', 'wts-btn-text-html', 'wts-btn-text-txt', 'wts-btn-text-clip'].forEach((id) => {
       const el = document.getElementById(id);
       if (el) el.disabled = b;
     });
@@ -1444,6 +1795,15 @@
           <button id="wts-btn-diag">诊断</button>
           <button id="wts-btn-copy">复制日志</button>
         </div>
+        <div class="wts-sep">网页正文导出（表格之外的所有文字）</div>
+        <div class="wts-row">
+          <button id="wts-btn-text-md" class="wts-primary">正文 → Markdown</button>
+          <button id="wts-btn-text-html">正文 → HTML</button>
+        </div>
+        <div class="wts-row">
+          <button id="wts-btn-text-txt">正文 → 纯文本</button>
+          <button id="wts-btn-text-clip">复制正文</button>
+        </div>
         <div id="wts-summary">尚未读取。</div>
         <div id="wts-log"></div>
         <input type="file" id="wts-file" accept=".json,.xlsx,application/json" style="display:none">
@@ -1474,6 +1834,10 @@
       finally { setBusy(false); }
     };
     document.getElementById('wts-btn-rollback').onclick = rollback;
+    document.getElementById('wts-btn-text-md').onclick = () => exportText('md');
+    document.getElementById('wts-btn-text-html').onclick = () => exportText('html');
+    document.getElementById('wts-btn-text-txt').onclick = () => exportText('txt');
+    document.getElementById('wts-btn-text-clip').onclick = () => exportText('clip');
     document.getElementById('wts-btn-copy').onclick = () => {
       const txt = S.logLines.map((l) => `[${l.time}] ${l.msg}`).join('\n');
       if (typeof GM_setClipboard === 'function') { GM_setClipboard(txt, 'text'); log('ok', '日志已复制到剪贴板。'); }
