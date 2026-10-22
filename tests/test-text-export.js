@@ -12,7 +12,7 @@ const SRC = path.join(__dirname, '..', 'webpage-table-sync.user.js');
 const src = fs.readFileSync(SRC, 'utf8');
 const cut = src.indexOf("if (document.readyState === 'loading')");
 const body = src.slice(0, cut) +
-  '\nreturn { contentToMarkdown, htmlToMarkdown, markdownToPlain, markdownToReadableHtml, buildTextDoc, S };\n})();';
+  '\nreturn { contentToMarkdown, htmlToMarkdown, markdownToPlain, markdownToReadableHtml, buildTextDoc, listExpFields, discoverExtraTextFields, S };\n})();';
 
 const { document, window } = parseHTML('<!DOCTYPE html><html><head></head><body></body></html>');
 window.location = { href: 'http://test-host/public/experiment.html?id=22', search: '?id=22', pathname: '/public/experiment.html', host: 'test-host' };
@@ -167,9 +167,15 @@ console.log('\n=== E. 组装整篇文档（含 15 个章节）===');
   has('基本信息：难度', md, '★★★★');
   has('基本信息：虚拟实验', md, 'http://lab.example/virtual');
   ['核心知识点', '前置知识要求', '实验目的', '实验原理', '实验器材', '安全注意事项',
-    '操作步骤 / 流程', '操作要点与注意事项', '误差分析', '结果要求', '课后思考题', '拓展应用', '自测题库']
+    '操作步骤 / 流程', '操作要点与注意事项', '数据处理流程与公式', '误差分析', '实验结果分析要求',
+    '课后思考题', '拓展应用', '自测题库']
     .forEach((t) => has('章节：' + t, md, '## ' + t));
-  has('表格类内容单独成节并注明', md, '数据记录与数据处理（表格，见网页）');
+  ok('数据处理区块顺序 = 流程公式 → 误差分析 → 结果要求',
+    md.indexOf('## 数据处理流程与公式') < md.indexOf('## 误差分析') &&
+    md.indexOf('## 误差分析') < md.indexOf('## 实验结果分析要求'),
+    '顺序不对');
+  has('表格类内容单独成节并注明', md, '数据记录表说明（表格，见网页）');
+  has('数据处理说明文字被收录', md, '数据处理说明');
   has('表格文字说明保留', md, '数据处理说明');
   has('内嵌表格转成 Markdown', md, '| 器材 |');
   has('LaTeX 未被破坏', md, '$R=U/I$');
@@ -191,6 +197,67 @@ console.log('\n=== G. 无数据时返回 null（由上层报错）===');
 {
   fns.S.expData = null;
   eq('S.expData 为空 → null', fns.buildTextDoc(), null);
+}
+
+// ============================================================
+// 回归：这就是用户报的问题 —— 数据处理三件套 + 未知字段兜底
+// ============================================================
+console.log('\n=== H. 同义字段名（后端改过名）也要收录 ===');
+{
+  fns.S.expId = '22';
+  // 只给"变体"字段名，不给标准名 —— 导出必须仍能拿到这三块
+  fns.S.expData = {
+    name: '别名字段实验',
+    dataCalc: '<h3>处理流程</h3><p>用 $R=U/I$ 逐点算电阻</p><p>再算 $\\lg I_0$</p>',
+    errorAnalysisTemplate: '<p>【误差分析通用模板】①系统误差 ②随机误差 ③仪器误差</p>',
+    resultAnalysisRequire: '<p>【结果分析要求】必须给出 $T_C$ 的不确定度</p>',
+  };
+  const doc = fns.buildTextDoc();
+  const md = doc.markdown;
+  has('dataCalc（驼峰）→ 数据处理流程与公式', md, '## 数据处理流程与公式');
+  has('自带公式未被破坏', md, '$R=U/I$');
+  has('errorAnalysisTemplate → 误差分析', md, '## 误差分析');
+  has('误差分析模板内容在', md, '误差分析通用模板');
+  has('resultAnalysisRequire → 实验结果分析要求', md, '## 实验结果分析要求');
+  has('结果要求内容在', md, '不确定度');
+  eq('三块都不算空章节', doc.emptySections.includes('误差分析') || doc.emptySections.includes('实验结果分析要求'), false);
+}
+
+console.log('\n=== I. 完全未知字段：自动识别并收录（不再丢内容）===');
+{
+  fns.S.expData = {
+    name: '未知字段实验',
+    core_knowledge: '<p>知识点</p>',
+    // 后端新加/改名的模块，映射表里没有
+    someNewModuleXyz: '<p>这是后端新增模块的内容，映射表里没有它。</p>',
+    dataProcessingFlow: '<p>处理流程变体字段</p>',
+    // 应被跳过的东西
+    videoPrinciple: '/uploads/v.mp4',
+    imageSafety: '/uploads/a.png',
+    teacherName: '张三',
+    createTime: '2026-09-01 10:00:00',
+    status: 1,
+    dataTableDefinition: '[{"id":1,"tableDef":{"headers":["a"],"rows":[]}}]',
+  };
+  const doc = fns.buildTextDoc();
+  const md = doc.markdown;
+  has('未知字段内容被收录', md, '这是后端新增模块的内容');
+  ok('未知字段列入 extraFields', doc.extraFields.includes('someNewModuleXyz'), JSON.stringify(doc.extraFields));
+  ok('dataProcessingFlow 也被识别（变体）', /(dataProcessingFlow|处理流程变体)/.test(md), md.slice(0, 600));
+  ok('视频字段不被当正文', !md.includes('/uploads/v.mp4'), '视频路径混进来了');
+  ok('图片字段不被当正文', !md.includes('/uploads/a.png'), '图片路径混进来了');
+  ok('纯 JSON 字段不被当正文', !md.includes('tableDef'), 'JSON 混进来了');
+}
+
+console.log('\n=== J. listExpFields 诊断：能标出每个字段的去向 ===');
+{
+  const rows = fns.listExpFields();
+  ok('返回字段清单', Array.isArray(rows) && rows.length > 0, '空清单');
+  const byKey = {};
+  rows.forEach((r) => { byKey[r.key] = r.verdict; });
+  eq('core_knowledge 标注为收录', byKey.core_knowledge, '收录');
+  ok('dataTableDefinition 标注为跳过', /跳过/.test(byKey.dataTableDefinition || ''), byKey.dataTableDefinition);
+  ok('未知模块标注为收录(自动识别)', /自动识别/.test(byKey.someNewModuleXyz || ''), byKey.someNewModuleXyz);
 }
 
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);

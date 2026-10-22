@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         实验数据表格 同步器（导出/导入 · 近代物理实验平台）
 // @namespace    local.experiment-table-sync
-// @version      1.2.0
+// @version      1.2.3
 // @description  把 experiment.html?id=NN 里的 4.1 数据记录表（多张）导出为 JSON(主存档)+XLSX(方便手算)，本地改完后可安全回传：GET→三方合并→POST→回读校验，上传前自动备份，支持一键回滚。
 // @author       (anonymous)
 // @match        http://119.91.120.143:8081/public/experiment.html*
@@ -154,7 +154,7 @@
     try {
       if (typeof GM_info !== 'undefined' && GM_info.script && GM_info.script.version) return GM_info.script.version;
     } catch (e) {}
-    return '1.2.0';
+    return '1.2.3';
   }
 
   // ============================================================
@@ -311,10 +311,45 @@
     return null;
   }
 
+  /**
+   * 服务器**还没存过这个学生的数据**时（GET 返回空表列表），
+   * 用接口模板定义生成"全空的表"作为写入目标。
+   *
+   * 为什么必须这么做？—— 否则上传时 `server.tables` 是空的，
+   * `computeMerge` 会把文件里每张表都判成"服务器上不存在"→ 整表跳过 → 0 改动 → 静默不发请求。
+   * 实测触发案例：椭偏法实验（exp 28）第一次上传，说明页写着"服务器最后更新 (无)"，
+   * 文件里 8 张表、用户填了几十个数，点确认却什么都没发生。
+   */
+  function seedServerTablesFromDefs(tables, defs) {
+    if (!Array.isArray(defs) || !defs.length) return tables;
+    const exist = new Set(tables.map((t) => String(t.id)));
+    let seeded = 0;
+    defs.forEach((d) => {
+      if (d.id === undefined || d.id === null || exist.has(String(d.id))) return;
+      if (!Array.isArray(d.headers) || !d.headers.length) return;
+      const rows = [];
+      const n = Math.max(d.expectedRows || 0, 1);
+      for (let r = 0; r < n; r++) rows.push({ cells: new Array(d.headers.length).fill('') });
+      tables.push({
+        id: d.id,
+        name: toStr(d.name),
+        headers: d.headers.map(toStr),
+        rows,
+        _fromDefs: true,
+      });
+      exist.add(String(d.id));
+      seeded++;
+    });
+    if (seeded) log('warn', `服务器上还没有你这个实验的已保存数据 → 已按模板定义生成 ${seeded} 张空表作为写入目标（首次上传会新建记录）`);
+    return tables;
+  }
+
   async function loadServerData() {
     const r = await api('GET', `${API_DATA_RECORD}/${encodeURIComponent(S.expId)}`);
     const data = r.json && r.json.code === 1 ? r.json.data : null;
     const tables = normalizeServerTables(data && data.table_data);
+    // 用接口模板补上"服务器还没存过"的表（没有已存数据 / 只存了一部分时都要补）
+    seedServerTablesFromDefs(tables, S.defs);
     S.server = {
       tables,
       table_data: data ? data.table_data : null,
@@ -542,8 +577,8 @@
   async function exportXLSX() {
     if (S.busy) return; setBusy(true);
     try {
-      const XLSX = getXLSX();
-      if (!XLSX) throw new Error('SheetJS 未加载（@require 失败？）。可改用「导出 JSON」。');
+      const XLSX = await ensureXLSX();
+      if (!XLSX) throw new Error('SheetJS 加载失败（网络访问不到 CDN）。可以：① 改用「导出 JSON」，② 网络恢复后在「诊断」里重试加载 SheetJS。');
       await refreshAll();
       const payload = buildPayload();
       const wb = XLSX.utils.book_new();
@@ -675,7 +710,12 @@
   // ============================================================
   // 7.5 网页正文导出（表格之外的所有文字）
   // ============================================================
-  /** 正文分区：字段名 → 章节标题（顺序即文档顺序；表格相关字段**不含**在这里） */
+  /**
+   * 正文分区：字段名 → 章节标题（顺序即文档顺序）。
+   * ⚠ 顺序刻意对齐页面「数据处理」这一块的渲染顺序：
+   *    数据处理流程与公式(data_calc) → 误差分析(error_analysis) → 实验结果分析要求(result_require)
+   * 之前漏了 data_calc，导致"数据处理模块"整段缺失、后面两个模块也找不到上下文。
+   */
   const TEXT_SECTIONS = [
     ['__basic', '实验基本信息'],
     ['core_knowledge', '核心知识点'],
@@ -687,14 +727,54 @@
     ['safety_content', '安全注意事项'],
     ['operation_flow', '操作步骤 / 流程'],
     ['operation_tips', '操作要点与注意事项'],
+    ['data_calc', '数据处理流程与公式'],
     ['error_analysis', '误差分析'],
-    ['result_require', '结果要求'],
+    ['result_require', '实验结果分析要求'],
     ['after_question', '课后思考题'],
     ['expand_content', '拓展应用'],
     ['test_bank', '自测题库'],
   ];
-  // 这些字段属于"表格数据"，由数据记录表功能负责，正文导出里跳过
-  const TEXT_SKIP_FIELDS = new Set(['data_table', 'data_calc', 'dataTableDefinition', 'data_table_definition']);
+  /**
+   * 同义字段名 → 标准字段名。不同实验/改版后的后端可能换字段名（如 errorAnalysisTemplate），
+   * 这里做一层归一，命中即按标准字段归类，避免"页面上有、导出里没有"。
+   */
+  const TEXT_ALIASES = {
+    data_calc: ['dataCalc', 'data_calc_content', 'data_calc_content_html', 'dataProcess', 'data_process',
+      'dataProcessing', 'process_flow', 'data_flow', 'data_calc_formula', 'dataCalcFormula'],
+    error_analysis: ['errorAnalysis', 'error_analysis_template', 'errorAnalysisTemplate', 'errorAnalysisContent',
+      'error_require', 'errorRequire', 'error_analysis_require', 'errorAnalysisRequire'],
+    result_require: ['resultRequire', 'resultRequireContent', 'result_require_content', 'result_analysis',
+      'resultAnalysis', 'result_analysis_require', 'resultAnalysisRequire', 'resultRequirement', 'result_requirement'],
+    principle_content: ['principleContent', 'principle', 'principle_content_html'],
+    operation_flow: ['operationFlow', 'operation_flow_content', 'operationFlowContent'],
+    operation_tips: ['operationTips', 'operation_tips_content', 'operationTipsContent'],
+    target_content: ['targetContent', 'target', 'target_content_html'],
+    safety_content: ['safetyContent', 'safety', 'safety_content_html'],
+    preview_question: ['previewQuestion', 'preview_question_content', 'previewQuestionContent'],
+    after_question: ['afterQuestion', 'after_question_content', 'afterQuestionContent'],
+    expand_content: ['expandContent', 'expand', 'expand_content_html'],
+    test_bank: ['testBank', 'test_bank_content', 'testBankContent'],
+    core_knowledge: ['coreKnowledge'],
+    pre_knowledge: ['preKnowledge'],
+    equipment_table: ['equipmentTable'],
+  };
+  // 这些字段不是"正文内容"，导出时跳过（表格数据 / 媒体链接 / 元信息）
+  const TEXT_SKIP_FIELDS = new Set([
+    '__basic', 'name', 'category_name', 'category', 'difficulty', 'period', 'id', 'create_time', 'update_time',
+    'data_table', 'dataTableDefinition', 'data_table_definition',
+    'virtualLabUrl', 'status', 'sort', 'teacher', 'teacher_id', 'author', 'remark',
+    'self_test', 'selfTest', 'self_test_json', 'quiz', 'homework', 'reading_limit_time', 'is_publish', 'is_delete',
+  ]);
+  // 子串命中即跳过：视频/图片/封面等媒体字段，以及 *Content 这种"渲染后的 DOM 副本"
+  const TEXT_SKIP_RE = /(video|image|img|pic|cover|attachment|file_?url|thumbnail|icon)|Content$/i;
+  /** 未知字段的兜底中文名（认不出就给个能看懂的名字） */
+  const TEXT_LABEL_MAP = {
+    data_calc: '数据处理流程与公式', error_analysis: '误差分析', result_require: '实验结果分析要求',
+    dataProcess: '数据处理流程与公式', data_process: '数据处理流程与公式',
+    errorAnalysisTemplate: '误差分析', error_analysis_template: '误差分析',
+    resultAnalysisRequire: '实验结果分析要求', result_analysis_require: '实验结果分析要求',
+    summary: '小结', conclusion: '结论', discussion: '讨论', notes: '备注',
+  };
 
   /** 让 HTML 变成好读的 Markdown（只处理正文里实际出现的语法，够用且不会乱） */
   function htmlToMarkdown(root) {
@@ -839,6 +919,58 @@
       .trim();
   }
 
+  /** 取字段内容：标准名没有就试同义词（不同版本后端字段名可能不同） */
+  function getFieldValue(exp, key) {
+    if (!exp) return '';
+    const direct = exp[key];
+    if (toStr(direct).trim()) return direct;
+    const aliases = TEXT_ALIASES[key] || [];
+    for (const a of aliases) {
+      const v = exp[a];
+      if (toStr(v).trim()) return v;
+    }
+    return '';
+  }
+
+  /** 判断一个字段值像不像"可读的正文内容"（而不是 URL / JSON / 短标签） */
+  function looksLikeContent(v) {
+    if (typeof v !== 'string') return false;
+    const s = v.trim();
+    if (s.length < 2) return false;
+    if (/^(https?:\/\/|\/uploads\/|\/public\/)/i.test(s)) return false;   // 纯链接
+    if (/^[\w.-]+\.(png|jpe?g|gif|mp4|webm|svg|pdf)$/i.test(s)) return false;
+    if (/^[\[{]/.test(s)) return false;                                    // 纯 JSON
+    if (/^[a-z0-9_-]+$/i.test(s) && s.length <= 12) return false;          // 短标识符
+    return /<[a-z][\s\S]*>/i.test(s) || s.length >= 20 || /[\n$]/.test(s);
+  }
+
+  /** camelCase / snake_case → 可读中文兜底名（认不出就用原始键名） */
+  function humanizeFieldKey(k) {
+    if (TEXT_LABEL_MAP[k]) return TEXT_LABEL_MAP[k];
+    const plain = String(k).replace(/[_-]+/g, ' ').replace(/([a-z])([A-Z])/g, '$1 $2').trim();
+    return plain ? plain.charAt(0).toUpperCase() + plain.slice(1) : String(k);
+  }
+
+  /**
+   * 兜底发现：把**所有未被映射**、但看起来是正文的字段也导出来。
+   * 这是为了解决"后端字段名变了 / 这个实验多了某个模块 → 页面上看得到、导出里却没有"。
+   */
+  function discoverExtraTextFields(exp) {
+    if (!exp) return [];
+    const known = new Set(TEXT_SKIP_FIELDS);
+    TEXT_SECTIONS.forEach(([k]) => known.add(k));
+    Object.keys(TEXT_ALIASES).forEach((k) => TEXT_ALIASES[k].forEach((a) => known.add(a)));
+    const out = [];
+    Object.keys(exp).forEach((k) => {
+      if (known.has(k)) return;
+      if (TEXT_SKIP_RE.test(k)) return;
+      const v = exp[k];
+      if (!looksLikeContent(v)) return;
+      out.push({ key: k, title: humanizeFieldKey(k), raw: v });
+    });
+    return out;
+  }
+
   /** 组装整篇正文文档（Markdown） */
   function buildTextDoc() {
     const exp = S.expData;
@@ -858,33 +990,85 @@
 
     const toc = [];
     const bodies = [];
-    TEXT_SECTIONS.forEach(([key, title], i) => {
-      const md = key === '__basic' ? basic : contentToMarkdown(exp[key]);
-      if (!md) return;
+    const missing = [];
+    const usedKeys = new Set();
+
+    TEXT_SECTIONS.forEach(([key, title]) => {
+      if (key === '__basic') {
+        toc.push(`${toc.length + 1}. ${title}`);
+        bodies.push(`\n---\n\n## ${title}\n\n${basic}`);
+        return;
+      }
+      const raw = getFieldValue(exp, key);
+      const md = contentToMarkdown(raw);
+      if (!md) { missing.push(title); return; }
+      usedKeys.add(key);
+      (TEXT_ALIASES[key] || []).forEach((a) => { if (toStr(exp[a]).trim()) usedKeys.add(a); });
       toc.push(`${toc.length + 1}. ${title}`);
       bodies.push(`\n---\n\n## ${title}\n\n${md}`);
     });
-    // 补一句：如果模板把表格说明写在 data_table / data_calc 里，也给它留个索引
-    const tableish = ['data_table', 'data_calc']
-      .map((k) => contentToMarkdown(exp[k]))
-      .filter((x) => x);
-    if (tableish.length) {
-      toc.push(`${toc.length + 1}. 数据记录与数据处理（表格，见网页）`);
-      bodies.push(`\n---\n\n## 数据记录与数据处理（表格，见网页）\n\n` +
-        `> 这部分是**表格类**内容，本文件只保留其文字说明；填写与回传请用「表格同步器」。\n\n` +
-        tableish.join('\n\n'));
+
+    // 表格类内容的"文字说明"（data_table 只保留说明，数据本身归表格同步器）
+    const tableText = contentToMarkdown(exp.data_table);
+    if (tableText) {
+      toc.push(`${toc.length + 1}. 数据记录表说明（表格，见网页）`);
+      bodies.push(`\n---\n\n## 数据记录表说明（表格，见网页）\n\n` +
+        `> 这部分是**表格类**内容，本文件只保留其文字说明；填写与回传请用「表格同步器」。\n\n${tableText}`);
+      usedKeys.add('data_table');
     }
+
+    // 兜底：把没被上面任何一条覆盖、但看着是正文的字段也导出来
+    const extra = discoverExtraTextFields(exp);
+    const extras = [];
+    extra.forEach((x) => {
+      const md = contentToMarkdown(x.raw);
+      if (!md) return;
+      usedKeys.add(x.key);
+      extras.push({ key: x.key, title: x.title, md });
+      toc.push(`${toc.length + 1}. ${x.title}`);
+      bodies.push(`\n---\n\n## ${x.title}\n\n${md}`);
+    });
+
     if (!bodies.length) return null;
 
-    const empty = TEXT_SECTIONS.filter(([k]) => k !== '__basic' && !contentToMarkdown(exp[k])).map(([, t]) => t);
     const doc = [
       parts.join('\n'),
       '\n## 目录\n\n' + toc.join('\n'),
       bodies.join('\n'),
-      empty.length ? `\n---\n\n> 以下章节本次为空（模板未填写）：${empty.join('、')}\n` : '',
+      missing.length ? `\n---\n\n> 以下章节本次为空（模板未填写）：${missing.join('、')}\n` : '',
+      extras.length ? `\n> 附：以下章节是按接口字段自动识别的（字段名未在已知映射表里）：${extras.map((e) => `${e.key} → ${e.title}`).join('；')}\n` : '',
       `\n---\n\n*本文件由「表格同步器」正文导出生成；公式为 LaTeX 原文，可直接粘进支持 LaTeX 的编辑器。*\n`,
     ].join('\n');
-    return { markdown: doc, name: toStr(exp.name) || 'experiment', sectionCount: toc.length, emptySections: empty };
+    return {
+      markdown: doc,
+      name: toStr(exp.name) || 'experiment',
+      sectionCount: toc.length,
+      emptySections: missing,
+      extraFields: extras.map((e) => e.key),
+      usedFields: [...usedKeys],
+    };
+  }
+
+  /** 诊断用：列出接口里所有字段，标出哪些被收录、哪些被跳过、哪些不认识却像正文 */
+  function listExpFields() {
+    const exp = S.expData;
+    if (!exp) return [];
+    const known = new Set(TEXT_SECTIONS.map(([k]) => k));
+    const aliasOf = {};
+    Object.keys(TEXT_ALIASES).forEach((k) => TEXT_ALIASES[k].forEach((a) => { aliasOf[a] = k; }));
+    const extraKeys = new Set(discoverExtraTextFields(exp).map((x) => x.key));
+    return Object.keys(exp).sort().map((k) => {
+      const v = exp[k];
+      const s = typeof v === 'string' ? v : JSON.stringify(v);
+      let verdict;
+      if (known.has(k)) verdict = '收录';
+      else if (aliasOf[k]) verdict = '收录(同义→' + aliasOf[k] + ')';
+      else if (k === 'data_table') verdict = '收录(仅文字)';
+      else if (extraKeys.has(k)) verdict = '收录(自动识别)';
+      else if (TEXT_SKIP_FIELDS.has(k) || TEXT_SKIP_RE.test(k)) verdict = '跳过';
+      else verdict = looksLikeContent(v) ? '未收录' : '非正文';
+      return { key: k, len: s == null ? 0 : String(s).length, verdict };
+    });
   }
 
   /** 把 Markdown 变成可离线阅读的 HTML（自带极简渲染 + KaTeX 公式） */
@@ -1019,6 +1203,32 @@ ${body}
     } finally { setBusy(false); }
   }
 
+  /** 字段体检：把接口里每个字段的去向打出来（缺模块时用它定位） */
+  async function auditExpFields() {
+    if (S.busy) return; setBusy(true);
+    try {
+      await loadExpData(true);
+      const rows = listExpFields();
+      if (!rows.length) throw new Error('没有读到实验数据（未登录？）');
+      log('ok', `================ 字段体检：共 ${rows.length} 个字段 ================`);
+      const missed = rows.filter((r) => r.verdict === '未收录');
+      const skipped = rows.filter((r) => r.verdict === '跳过');
+      const notText = rows.filter((r) => r.verdict === '非正文');
+      const used = rows.filter((r) => /收录/.test(r.verdict));
+      rows.forEach((r) => {
+        const tag = r.verdict === '未收录' ? 'err' : (/自动识别/.test(r.verdict) ? 'warn' : 'net');
+        log(tag, `  ${r.key.padEnd(28)} ${String(r.len).padStart(6)}B  → ${r.verdict}`);
+      });
+      log(used.length ? 'ok' : 'err', `收录 ${used.length} 个 / 跳过 ${skipped.length} 个 / 非正文 ${notText.length} 个 / 未收录 ${missed.length} 个`);
+      if (missed.length) log('warn', `⚠ 未收录的字段看起来像正文：${missed.map((r) => r.key).join('、')}　→ 把它们名字发我，我加进映射表`);
+      else log('ok', '没有漏掉的正文模块。');
+      log('ok', '================ 字段体检结束 ================');
+    } catch (e) {
+      log('err', '字段体检失败：' + e.message);
+      alert('字段体检失败：' + e.message);
+    } finally { setBusy(false); }
+  }
+
   function getXLSX() {
     try {
       if (typeof XLSX !== 'undefined' && XLSX && XLSX.utils) return XLSX;
@@ -1026,7 +1236,93 @@ ${body}
     try {
       if (typeof unsafeWindow !== 'undefined' && unsafeWindow.XLSX && unsafeWindow.XLSX.utils) return unsafeWindow.XLSX;
     } catch (e) {}
+    try {
+      if (typeof window !== 'undefined' && window.XLSX && window.XLSX.utils) return window.XLSX;
+    } catch (e) {}
     return null;
+  }
+
+  /**
+   * SheetJS 的多来源兜底加载。
+   * 现实问题：`@require` 指向 jsDelivr，而国内网络经常拉不到 → 脚本能跑，但 .xlsx 完全无法解析。
+   * 这里在需要时按顺序尝试多个 CDN（含国内可访问的 npmmirror），先注入 <script>，
+   * 不行再用 GM_xmlhttpRequest 取源码执行（可绕开页面 script-src CSP）。全部失败才放弃。
+   */
+  const XLSX_CDN_CANDIDATES = [
+    'https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js',
+    'https://registry.npmmirror.com/xlsx/0.18.5/files/dist/xlsx.full.min.js',
+    'https://fastly.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js',
+    'https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js',
+    'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js',
+  ];
+  let xlsxLoadPromise = null;
+
+  function injectScript(url, timeoutMs) {
+    return new Promise((resolve) => {
+      const s = document.createElement('script');
+      let done = false;
+      const finish = (ok, why) => {
+        if (done) return;
+        done = true;
+        try { s.onload = s.onerror = null; } catch (e) {}
+        try { if (s.parentNode) s.parentNode.removeChild(s); } catch (e) {}
+        resolve({ ok, why: why || '' });
+      };
+      s.async = true;
+      s.src = url;
+      s.onload = () => { const X = getXLSX(); finish(!!X, X ? '' : '已加载但未暴露 XLSX'); };
+      s.onerror = () => finish(false, '脚本加载失败（网络被拦/404）');
+      setTimeout(() => finish(false, '超时'), timeoutMs || 10000);
+      try { (document.head || document.documentElement).appendChild(s); }
+      catch (e) { finish(false, '注入失败：' + e.message); }
+    });
+  }
+
+  async function evalScriptViaGM(url) {
+    const code = await new Promise((resolve, reject) => {
+      if (typeof GM_xmlhttpRequest !== 'function') { reject(new Error('无 GM_xmlhttpRequest')); return; }
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        onload: (r) => resolve(r.responseText || ''),
+        onerror: () => reject(new Error('GM 请求失败')),
+        ontimeout: () => reject(new Error('GM 请求超时')),
+      });
+    });
+    if (!code || code.length < 1000) throw new Error('内容过短，可能不是库文件');
+    // eslint-disable-next-line no-new-func
+    const fn = new Function('window', 'document', 'self', 'globalThis', code);
+    fn(window, document, window, window);
+    return getXLSX();
+  }
+
+  /** 确保 SheetJS 可用（已在就立即返回；否则按候选源依次加载）。并发调用共享同一个 Promise。 */
+  async function ensureXLSX() {
+    const now = getXLSX();
+    if (now) return now;
+    if (xlsxLoadPromise) return xlsxLoadPromise;
+    xlsxLoadPromise = (async () => {
+      for (let i = 0; i < XLSX_CDN_CANDIDATES.length; i++) {
+        const url = XLSX_CDN_CANDIDATES[i];
+        let host = url;
+        try { host = new URL(url).host; } catch (e) {}
+        log('net', `SheetJS 未就绪 → 尝试从 ${host} 加载（第 ${i + 1}/${XLSX_CDN_CANDIDATES.length} 个来源）…`);
+        const r1 = await injectScript(url);
+        if (r1.ok) { log('ok', `SheetJS 已通过 ${host} 加载成功`); updateXlsxBadge(); return getXLSX(); }
+        log('warn', `  ${host}：${r1.why}${r1.why.includes('失败') ? '，改用 GM 通道重试' : ''}`);
+        try {
+          if (await evalScriptViaGM(url)) { log('ok', `SheetJS 已通过 ${host}（GM 通道）加载成功`); updateXlsxBadge(); return getXLSX(); }
+          log('warn', `  ${host}：GM 通道拿到了代码，但仍未暴露 XLSX`);
+        } catch (e) {
+          log('warn', `  ${host}：GM 通道也失败（${e.message}）`);
+        }
+      }
+      log('err', 'SheetJS 所有来源都加载失败（网络或 CSP 限制）。' +
+        '→ .xlsx 导入/导出不可用，但【导出/导入 JSON】完全不受影响，数据一样能存取。' +
+        '→ 也可等网络恢复后在「诊断」里重试加载。');
+      return null;
+    })();
+    try { return await xlsxLoadPromise; } finally { xlsxLoadPromise = null; }
   }
 
   // ============================================================
@@ -1097,9 +1393,17 @@ ${body}
     const isXlsx = /\.xlsx$/i.test(filename) || (arrayBuffer && !text);
     if (isXlsx) {
       const XLSX = getXLSX();
-      if (!XLSX) throw new Error('SheetJS 未加载，无法读取 .xlsx；请改用 JSON 文件导入。');
+      if (!XLSX) throw new Error('SheetJS 未就绪，无法读取 .xlsx；请改用 JSON 文件导入（或先点「诊断」让脚本自动加载）。');
       const wb = XLSX.read(arrayBuffer, { type: 'array', cellDates: false });
       const warnings = [];
+      // 从「说明_README」里读出这个文件是哪个实验导出的（用于和当前页面比对）
+      let sourceExpId = null;
+      if (wb.Sheets['说明_README']) {
+        const infoAoa = aoaFromSheet(XLSX, wb.Sheets['说明_README']).aoa;
+        for (const row of infoAoa) {
+          if (row && String(row[0]).trim() === '实验 ID') { sourceExpId = String(row[1] === undefined ? '' : row[1]).trim(); break; }
+        }
+      }
       const dataSheets = wb.SheetNames.filter((n) => /^T1?_?\d+_/.test(n) || /^T\d+_/.test(n));
       const candidates = dataSheets.length
         ? dataSheets
@@ -1187,7 +1491,7 @@ ${body}
         if (!presets.size) presets = null;
       }
       if (!tables.length) throw new Error('这个 Excel 里没有识别到数据表（工作表名需形如 T0_表名）');
-      return { source: 'xlsx', tables, baseline, presets, warnings };
+      return { source: 'xlsx', tables, baseline, presets, warnings, sourceExpId };
     }
 
     // JSON
@@ -1234,7 +1538,7 @@ ${body}
       if (!presets.size) presets = null;
     }
     if (!baseline) warnings.push('文件里没有 _baseline 快照：本次导入按「只补空缺」处理，不会清空服务器数据。');
-    return { source: 'json', tables: norm, baseline, presets, warnings };
+    return { source: 'json', tables: norm, baseline, presets, warnings, sourceExpId: (obj.file && obj.file.expId !== undefined ? String(obj.file.expId) : null) };
   }
 
   // ============================================================
@@ -1257,33 +1561,76 @@ ${body}
     return Math.max(...rows.map((r) => rowCells(r).length), headerLen, 0);
   }
 
+  /** 表头签名：用来在 id 对不上时做"同一张表"的判定 */
+  function headerSignature(t) {
+    const hs = (t && Array.isArray(t.headers)) ? t.headers : [];
+    return hs.map((h) => String(h === null || h === undefined ? '' : h).trim()).join('\u0001');
+  }
+
+  /**
+   * 把**文件里的表**映射到**服务器上的表**。顺序：
+   *   1) id 完全相同（最可靠）
+   *   2) 表名完全相同，且服务器里唯一
+   *   3) 表头签名完全相同、列数一致，且服务器里唯一
+   * 为什么要回退？——老师改模板（增删表）会让 id 整体错位，纯按 id 匹配会"整表跳过"，
+   * 用户看到的就是"点了确认没反应"。回退只在**唯一匹配**时生效，宁可跳过也不乱写。
+   */
+  function matchFileToServerTable(ft, serverTables, usedServerIds) {
+    const st = serverTables.find((t) => String(t.id) === String(ft.id));
+    if (st) return { st, by: 'id' };
+    const fname = toStr(ft.name).trim();
+    if (fname) {
+      const cands = serverTables.filter((t) => !usedServerIds.has(String(t.id)) && toStr(t.name).trim() === fname);
+      if (cands.length === 1) return { st: cands[0], by: 'name' };
+    }
+    const sig = headerSignature(ft);
+    if (sig) {
+      const cands = serverTables.filter((t) => !usedServerIds.has(String(t.id)) && headerSignature(t) === sig);
+      if (cands.length === 1) return { st: cands[0], by: 'headers' };
+    }
+    return { st: null, by: null };
+  }
+
   function computeMerge(file, server) {
     const changes = [];
     const mergedCell = new Map();
     const warnings = [];
-    let stats = { mod: 0, add: 0, del: 0, tables: 0, skipped: 0, presetSkipped: 0 };
+    const mapping = [];
+    const usedServerIds = new Set();
+    let stats = { mod: 0, add: 0, del: 0, tables: 0, skipped: 0, presetSkipped: 0, remapped: 0 };
 
     const fileTables = (file && Array.isArray(file.tables)) ? file.tables : [];
     const serverTables = (server && Array.isArray(server.tables)) ? server.tables : [];
 
     for (const ft of fileTables) {
-      const st = serverTables.find((t) => String(t.id) === String(ft.id));
+      const matched = matchFileToServerTable(ft, serverTables, usedServerIds);
+      const st = matched.st;
       if (!st) {
-        warnings.push(`表 id=${ft.id} 在服务器上不存在，整表跳过（不动服务器）`);
+        warnings.push(`表 id=${ft.id}（${ft.name || '未命名'}）在服务器上找不到对应表，整表跳过（不动服务器）`);
         stats.skipped++;
+        mapping.push({ fileId: ft.id, targetId: null, by: null, name: ft.name || '' });
         continue;
       }
+      // ⚠ 之后所有 key / 改动都记在**目标表 id**上：buildUploadTables 是按服务器表 id 取 key 的。
+      const targetId = st.id;
+      usedServerIds.add(String(targetId));
+      if (targetId !== ft.id) {
+        stats.remapped++;
+        warnings.push(`表 id=${ft.id} 在服务器上不存在，但按${matched.by === 'name' ? '表名' : '表头'}唯一匹配到了服务器表 id=${targetId}，已按后者写入`);
+      }
+      mapping.push({ fileId: ft.id, targetId, by: matched.by, name: ft.name || '' });
+
       const fHeaders = Array.isArray(ft.headers) ? ft.headers : [];
       const sHeaders = Array.isArray(st.headers) ? st.headers : [];
       if (fHeaders.length && sHeaders.length && fHeaders.length !== sHeaders.length) {
-        warnings.push(`表 id=${ft.id}：列数不一致（文件 ${fHeaders.length} / 服务器 ${sHeaders.length}），多出的列会被忽略`);
+        warnings.push(`表 id=${ft.id}→${targetId}：列数不一致（文件 ${fHeaders.length} / 服务器 ${sHeaders.length}），多出的列会被忽略`);
       }
       stats.tables++;
       const fRows = normRows(ft.rows);
       const sRows = normRows(st.rows);
       // curPresetRows = **当前模板**的预置行（预置格判定的权威来源）；
       // ft.presetRows 只在拿不到当前模板时兜底。
-      const curPresetRows = S.defRowsById.get(String(ft.id)) || ft.presetRows || [];
+      const curPresetRows = S.defRowsById.get(String(ft.id)) || S.defRowsById.get(String(targetId)) || ft.presetRows || [];
       const rows = Math.max(fRows.length, sRows.length);
       const cols = Math.max(expCols({ headers: fHeaders, rows: fRows }), expCols({ headers: sHeaders, rows: sRows }));
       for (let r = 0; r < rows; r++) {
@@ -1294,7 +1641,7 @@ ${body}
           const fv = frow && c < frow.cells.length ? toStr(frow.cells[c]) : '';
           const sv = srow && c < srow.cells.length ? toStr(srow.cells[c]) : '';
           const curPv = prow[c] === undefined || prow[c] === null ? '' : toStr(prow[c]);
-          const key = cellKey(ft.id, r, c);
+          const key = cellKey(targetId, r, c);
           const bv = file.baseline ? file.baseline.get(key) : undefined;
           // 文件里带的 _presets 快照（= 导出那一刻模板在这一格的值）。取不到就当空：
           // 只有"导出时为空、现在模板有值"才是模板新加的预置格，不能拿当前模板值反过来冒充快照。
@@ -1303,7 +1650,7 @@ ${body}
 
           if (fv === CLEAR_TOKEN) {
             // 显式清空同样遵守"预置格不入库"：服务器没存过、只是模板预置值 → 清空无意义，不写
-            if (sv !== '') { mergedCell.set(key, ''); changes.push({ t: ft.id, r, c, from: sv, to: '', kind: 'del' }); stats.del++; }
+            if (sv !== '') { mergedCell.set(key, ''); changes.push({ t: targetId, r, c, from: sv, to: '', kind: 'del' }); stats.del++; }
             continue;
           }
           if (hasBaseline) {
@@ -1325,14 +1672,14 @@ ${body}
             }
             if (fv === '') {
               // 改成空 → 「清空这一格」。只清服务器上真实存过的值：
-              if (sv !== '') { mergedCell.set(key, ''); changes.push({ t: ft.id, r, c, from: sv, to: '', kind: 'del' }); stats.del++; }
+              if (sv !== '') { mergedCell.set(key, ''); changes.push({ t: targetId, r, c, from: sv, to: '', kind: 'del' }); stats.del++; }
               // 若 sv === ''（这一格只是模板预置值），上面的预置分支已 continue；这里到不了。
               continue;
             }
             if (fv === sv) continue;                   // 服务器已是最新，无需上传
             mergedCell.set(key, fv);
             // 归类看"服务器上原来有没有值"，而不是看基线（基线里可能是预置回落值）
-            changes.push({ t: ft.id, r, c, from: sv, to: fv, kind: sv === '' ? 'add' : 'mod' });
+            changes.push({ t: targetId, r, c, from: sv, to: fv, kind: sv === '' ? 'add' : 'mod' });
             stats[sv === '' ? 'add' : 'mod']++;
           } else {
             // 无基线（手工 Excel）：绝不覆盖服务器已有值，只补空缺
@@ -1343,7 +1690,7 @@ ${body}
             }
             if (fv !== '' && sv === '') {
               mergedCell.set(key, fv);
-              changes.push({ t: ft.id, r, c, from: sv, to: fv, kind: 'add' });
+              changes.push({ t: targetId, r, c, from: sv, to: fv, kind: 'add' });
               stats.add++;
             } else if (fv !== '' && sv !== '' && fv !== sv) {
               warnings.push(`表 id=${ft.id} 第 ${r + 1} 行第 ${c + 1} 列：文件值「${fv}」与服务器值「${sv}」冲突，已保留服务器值（无基线，不覆盖）`);
@@ -1352,7 +1699,7 @@ ${body}
         }
       }
     }
-    return { changes, mergedCell, warnings, stats };
+    return { changes, mergedCell, warnings, stats, mapping };
   }
 
   /** 取某张表在表头上该用的 headers：定义优先，其次服务器，最后文件 */
@@ -1501,13 +1848,44 @@ ${body}
       log('net', `读取文件 ${file.name}（${file.size} B）`);
       const isXlsx = /\.xlsx$/i.test(file.name);
       let text = null, buf = null;
-      if (isXlsx) buf = await file.arrayBuffer();
-      else text = await file.text();
+      if (isXlsx) {
+        // 先确保 SheetJS 就绪（国内网络常常拉不到 @require，这里会走多 CDN 兜底）
+        if (!getXLSX()) {
+          log('net', '.xlsx 需要 SheetJS，正在尝试加载…');
+          if (!(await ensureXLSX())) {
+            throw new Error('SheetJS 加载失败（网络访问不到 CDN），无法读取 .xlsx。\n\n' +
+              '两条路：\n① 用「导出 JSON」拿到 .json，改完再用 JSON 导入（完全等价）；\n' +
+              '② 等网络恢复后点「诊断」重试加载 SheetJS。');
+          }
+        }
+        buf = await file.arrayBuffer();
+      } else {
+        text = await file.text();
+      }
 
       await refreshAll();
       const filePayload = parseFileToPayload(text, buf, file.name);
       filePayload.warnings.forEach((w) => log('warn', w));
       log('ok', `解析出 ${filePayload.tables.length} 张表${filePayload.baseline ? '（带基线，三方合并）' : '（无基线，只补空缺）'}`);
+
+      // ---- 文件来源 vs 当前页面：最容易"点了没反应"的原因之一 ----
+      const srcExp = filePayload.sourceExpId;
+      const curExp = toStr(S.expId).trim();
+      if (srcExp && curExp && String(srcExp) !== curExp) {
+        log('err', `⚠ 这个文件是从【实验 id=${srcExp}】导出的，而你当前在【实验 id=${curExp}】页面 —— 表 id 很可能对不上，上传会整表跳过。`);
+        const go = confirm(`这个文件是从「实验 id=${srcExp}」导出的，当前页面是「实验 id=${curExp}」。\n\n` +
+          '两者不一致时，文件里的表在服务器上通常找不到，上传会什么都不做。\n\n' +
+          '建议：取消 → 打开 id=' + srcExp + ' 的实验页面 → 在那里重新导入。\n\n' +
+          '仍要继续尝试吗？（继续不一定能成功）');
+        if (!go) {
+          log('warn', '已按你的选择中止导入（实验 id 不一致）。');
+          return;
+        }
+      } else if (srcExp) {
+        log('ok', `文件来源校验通过：文件来自实验 id=${srcExp}，与当前页面一致。`);
+      }
+      filePayload.expIdMismatch = !!(srcExp && curExp && String(srcExp) !== curExp);
+      filePayload.sourceExpId = srcExp;
 
       if (strictMode()) {
         log('warn', '已开启「严格覆盖」：将整份按文件内容写入服务器（含空单元格）！');
@@ -1536,12 +1914,53 @@ ${body}
       html += `<div class="wts-warn">严格覆盖模式：将把文件里的 ${p.file.tables.length} 张表整份写入（文件里空的格会被清空）。</div>`;
     } else {
       const s = p.merge.stats;
+      const mp = p.merge.mapping || [];
+      const unmatched = mp.filter((m) => m.targetId === null);
+      const remapped = mp.filter((m) => m.targetId !== null && String(m.targetId) !== String(m.fileId));
+
+      // ---- 文件来源：说明这个文件是哪个实验导出的 ----
+      if (p.file && p.file.sourceExpId) {
+        if (p.file.expIdMismatch) {
+          html += `<div class="wts-warn">❌ 这个文件是从<b>实验 id=${esc(p.file.sourceExpId)}</b>导出的，
+            但你当前在<b>实验 id=${esc(S.expId)}</b>页面。表 id 大概率对不上，请到 id=${esc(p.file.sourceExpId)} 的实验页面再导入。</div>`;
+        } else {
+          html += `<div style="color:#475569">文件来源：实验 id=${esc(p.file.sourceExpId)}（与当前页面一致 ✓）</div>`;
+        }
+      }
+
+      // ---- 表映射：先把"文件里的表 → 服务器上的表"摆出来，这是最容易被忽略的失败原因 ----
+      if (mp.length) {
+        html += `<div class="wts-t">表映射（文件 → 服务器）</div><ul>`;
+        mp.forEach((m) => {
+          if (m.targetId === null) {
+            html += `<li>❌ 文件表 id=${m.fileId}${m.name ? '「' + esc(m.name) + '」' : ''} → <b>服务器上找不到</b>（整表跳过）</li>`;
+          } else if (String(m.targetId) !== String(m.fileId)) {
+            html += `<li>⚠ 文件表 id=${m.fileId} → 服务器表 id=${m.targetId}（按${m.by === 'name' ? '表名' : '表头'}唯一匹配）</li>`;
+          } else {
+            html += `<li>✓ 文件表 id=${m.fileId} → 服务器表 id=${m.targetId}</li>`;
+          }
+        });
+        html += '</ul>';
+      }
+
       html += `<div>将修改 <b>${s.mod}</b> 格 · 新增 <b>${s.add}</b> 格 · 清空 <b>${s.del}</b> 格，涉及 <b>${s.tables}</b> 张表。</div>`;
       if (s.presetSkipped) {
         html += `<div class="wts-warn">另有 <b>${s.presetSkipped}</b> 格是「模板预置值」（如序号列、模板里印好的参数名），
           按约定<b>不入库</b>：页面上会靠模板自动回落显示，不需要上传。</div>`;
       }
-      if (!p.merge.changes.length) html += `<div class="wts-warn">没有检测到任何改动 —— 无需上传。</div>`;
+      if (remapped.length) {
+        html += `<div class="wts-warn">有 <b>${remapped.length}</b> 张表的 id 与服务器不一致，已按表名/表头唯一匹配后写入。
+          如果你怀疑匹配错了，请先取消，把文件重新导出一次再改。</div>`;
+      }
+      if (unmatched.length && !p.merge.changes.length) {
+        html += `<div class="wts-warn">⚠ <b>无法上传</b>：文件里 ${mp.length} 张表，
+          <b>${unmatched.length}</b> 张在服务器上找不到对应表，也没有产生任何改动。<br>
+          可能原因：① 在**别的实验页面**上传了这个实验的表；② 老师改过模板（表被增删，id 变了）；③ 服务器数据被重置。<br>
+          请确认当前页面 URL 的 <code>id=</code> 就是这个实验，并点「刷新服务器数据」后重试；
+          仍不行就点「字段体检/复制日志」把日志发我。</div>`;
+      } else if (!p.merge.changes.length) {
+        html += `<div class="wts-warn">没有检测到任何改动 —— 无需上传。</div>`;
+      }
       const byTable = new Map();
       p.merge.changes.forEach((c) => {
         if (!byTable.has(c.t)) byTable.set(c.t, []);
@@ -1570,6 +1989,19 @@ ${body}
       modal.style.display = 'flex';
       // 按钮文案按模式设置（必须在绑定前设好，避免"点太快读到旧文案"的错觉）
       okBtn.textContent = strictMode() ? '确认严格覆盖上传' : '确认上传改动';
+      okBtn.disabled = false;
+      // 明确"无法上传"的情况：一张表都没匹配上 + 没有任何改动 —— 直接禁用确认，别让用户以为点了没反应
+      {
+        const p = pendingImport;
+        const mp = (p && p.merge && p.merge.mapping) ? p.merge.mapping : [];
+        const unmatched = mp.filter((m) => m.targetId === null);
+        const blocked = p && p.mode !== 'strict' && !p.merge.changes.length && unmatched.length > 0;
+        if (blocked) {
+          okBtn.disabled = true;
+          okBtn.textContent = '无法上传（表 id 对不上，详见上方）';
+          log('err', `无法上传：文件 ${mp.length} 张表里有 ${unmatched.length} 张在服务器上找不到，且没有任何改动。`);
+        }
+      }
       let settled = false;
       const onOk = async () => {
         if (settled) return;
@@ -1624,7 +2056,24 @@ ${body}
           return;
         }
       } else {
-        if (!p.merge.changes.length) { log('warn', '无改动，未上传。'); return; }
+        if (!p.merge.changes.length) {
+          const mp = p.merge.mapping || [];
+          const unmatched = mp.filter((m) => m.targetId === null);
+          if (unmatched.length) {
+            log('err', `无改动，未上传。原因：文件里有 ${unmatched.length} 张表在服务器上找不到（${unmatched.map((m) => 'id=' + m.fileId).join('、')}）`);
+            alert('没有上传任何内容。\n\n原因：文件里的表 id 与当前服务器上的表 id 对不上，' +
+              `共 ${unmatched.length} 张被跳过（${unmatched.map((m) => 'id=' + m.fileId).join('、')}）。\n\n` +
+              '常见原因：\n' +
+              '① 这个文件是**另一个实验**导出的（检查页面 URL 的 id= 是否一致）\n' +
+              '② 老师改过模板，表被增删导致 id 变化\n' +
+              '③ 服务器数据被重置\n\n' +
+              '建议：在当前页面点「刷新服务器数据」→ 重新导出 → 在**新导出的文件**里填数据再上传；' +
+              '仍不行请点「复制日志」把日志发我。');
+          } else {
+            log('warn', '无改动，未上传。');
+          }
+          return;
+        }
         tables = buildUploadTables(p.server, p.merge.mergedCell, S.defs);
       }
 
@@ -1742,10 +2191,20 @@ ${body}
   function setBusy(b) {
     S.busy = b;
     ['wts-btn-json', 'wts-btn-xlsx', 'wts-btn-import', 'wts-btn-refresh', 'wts-btn-rollback',
-      'wts-btn-text-md', 'wts-btn-text-html', 'wts-btn-text-txt', 'wts-btn-text-clip'].forEach((id) => {
+      'wts-btn-text-md', 'wts-btn-text-html', 'wts-btn-text-txt', 'wts-btn-text-clip', 'wts-btn-fields'].forEach((id) => {
       const el = document.getElementById(id);
       if (el) el.disabled = b;
     });
+  }
+
+  /** 更新面板上的 XLSX 引擎状态小标 */
+  function updateXlsxBadge() {
+    const el = document.getElementById('wts-xlsx-badge');
+    if (!el) return;
+    const X = getXLSX();
+    el.textContent = X ? `XLSX 引擎：已就绪 ${X.version || ''}` : 'XLSX 引擎：未加载（点「诊断」重试）';
+    el.style.color = X ? '#15803d' : '#b45309';
+    el.title = X ? '可以正常导入/导出 .xlsx' : '网络访问不到 CDN 时，导入/导出 .xlsx 不可用；JSON 完全不受影响。点「诊断」可重新尝试加载';
   }
 
   function renderSummary(payload) {
@@ -1781,6 +2240,7 @@ ${body}
           <label>文件名前缀 <input type="text" id="wts-prefix" value="${esc(filePrefix())}"></label>
           <label>自定义文件名 <input type="text" id="wts-filename" placeholder="留空=带时间戳" style="width:118px" value="${esc((loadCfg().fileName) || '')}"></label>
           <label><input type="checkbox" id="wts-strict"> 严格覆盖（危险）</label>
+          <span id="wts-xlsx-badge" style="font-size:11px;color:#b45309">XLSX 引擎：检测中…</span>
         </div>
         <div class="wts-row">
           <button id="wts-btn-json" class="wts-primary">导出 JSON（主存档）</button>
@@ -1803,6 +2263,9 @@ ${body}
         <div class="wts-row">
           <button id="wts-btn-text-txt">正文 → 纯文本</button>
           <button id="wts-btn-text-clip">复制正文</button>
+        </div>
+        <div class="wts-row">
+          <button id="wts-btn-fields" title="列出接口里所有字段，标出哪些被收录/跳过/遗漏">字段体检</button>
         </div>
         <div id="wts-summary">尚未读取。</div>
         <div id="wts-log"></div>
@@ -1838,6 +2301,7 @@ ${body}
     document.getElementById('wts-btn-text-html').onclick = () => exportText('html');
     document.getElementById('wts-btn-text-txt').onclick = () => exportText('txt');
     document.getElementById('wts-btn-text-clip').onclick = () => exportText('clip');
+    document.getElementById('wts-btn-fields').onclick = auditExpFields;
     document.getElementById('wts-btn-copy').onclick = () => {
       const txt = S.logLines.map((l) => `[${l.time}] ${l.msg}`).join('\n');
       if (typeof GM_setClipboard === 'function') { GM_setClipboard(txt, 'text'); log('ok', '日志已复制到剪贴板。'); }
@@ -1910,7 +2374,13 @@ ${body}
       if (!feats.rowCells) log('err', '！！ 你在浏览器里装的是**旧版脚本**（缺 rowCells/mapLike 修复）——请重新复制本文件并覆盖旧脚本后刷新页面。');
       log('net', `页面 URL：${location.href}`);
       log('net', `URL 里的 id = ${S.expId}`);
-      log('net', `SheetJS = ${getXLSX() ? '已加载 (' + (getXLSX().version || '?') + ')' : '未加载'}`);
+      let xlsx = getXLSX();
+      log(xlsx ? 'ok' : 'warn', `SheetJS = ${xlsx ? '已加载 (' + (xlsx.version || '?') + ')' : '未加载（@require 很可能被网络拦了）'}`);
+      if (!xlsx) {
+        log('net', '正在尝试多来源加载 SheetJS（jsDelivr → npmmirror → fastly → unpkg → cdnjs）…');
+        xlsx = await ensureXLSX();
+        log(xlsx ? 'ok' : 'err', xlsx ? `SheetJS 加载成功（${xlsx.version || '?'}）` : 'SheetJS 仍然加载失败：.xlsx 功能不可用，但 JSON 导出/导入不受影响');
+      }
       log('net', `GM_xmlhttpRequest = ${typeof GM_xmlhttpRequest === 'function' ? '可用' : '不可用'}`);
       const me = await api('GET', '/api/student/info');
       const okLogin = me.json && me.json.code === 1;
@@ -1941,6 +2411,12 @@ ${body}
       p.warnings.forEach((w) => log('warn', w));
       const baks = backupHistory().filter((b) => b.expId === String(S.expId));
       log('net', `本地备份：${baks.length} 份${baks.length ? '，最近 ' + new Date(baks[0].at).toLocaleString() : ''}`);
+      if (S.server) {
+        const seeded = S.server.tables.filter((t) => t._fromDefs).length;
+        log(S.server.tables.length ? 'ok' : 'err',
+          `服务器已存数据：${S.server.tables.length} 张表${S.server.update_time ? '，最后更新 ' + S.server.update_time : '（无更新时间）'}` +
+          (seeded ? `；其中 ${seeded} 张是按模板补出来的空表（说明这个实验你还没保存过数据）` : ''));
+      }
     } catch (e) {
       log('err', '诊断异常：' + e.message);
     } finally {
@@ -1955,9 +2431,10 @@ ${body}
   async function main() {
     S.expId = getUrlParam('id');
     buildPanel();
+    updateXlsxBadge();
     log('ok', `表格同步器 v${scriptVersion()} 已加载，实验 id=${S.expId}`);
-    if (!/^experiment\.html/i.test(location.pathname)) {
-      log('warn', '当前不是 experiment.html 页面，部分功能可能无效。');
+    if (!/experiment/i.test(location.pathname)) {
+      log('warn', '当前页面路径里没有 experiment，可能不是实验详情页；接口仍按同源相对路径调用，若失败请核对 URL。');
     }
     if (typeof GM_registerMenuCommand === 'function') {
       GM_registerMenuCommand('导出 JSON', exportJSON);

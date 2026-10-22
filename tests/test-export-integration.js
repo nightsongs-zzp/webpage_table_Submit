@@ -293,6 +293,39 @@ apiHandler = (u, o) => {
     eq('每行都是 {cells:[...]}', Object.keys(lastPost.tableData.tables[0].rows[0]), ['cells']);
   }
 
+  console.log('\n=== H. 【首次上传】服务器还没有已存数据 → 用模板定义生成空表（回归：椭偏法 exp28）===');
+  {
+    // 服务器返回"没有记录"（code=1 但没有 table_data），这正是 exp28 第一次上传的状态
+    apiHandler = (u, o) => {
+      if (/\/api\/experiment\//.test(u)) return routes.exp();
+      if (/\/api\/student\/data-record$/.test(u) && o.method === 'POST') { const r = routes.post(o); lastPost = r.json._echo; return r; }
+      if (/\/api\/student\/data-record\//.test(u)) return { status: 200, json: { code: 1, data: null } };
+      return { status: 200, json: { code: 1, data: { username: 'x' } } };
+    };
+    await fns.refreshAll();
+    eq('服务器已存表为 0 时，按模板补出 2 张空表', fns.S.server.tables.length, 2);
+    eq('补出来的表带表头', fns.S.server.tables[0].headers.length, 4);
+    eq('补出来的表行数按模板', fns.S.server.tables[0].rows.length, 4);
+
+    // 文件里有用户填的值 → 必须能算出改动、也必须能组出上传体
+    const edited = {
+      tables: [{
+        id: 1, name: '表1',
+        headers: ['序号', '电压', '备注', 'x'],
+        rows: [{ cells: ['1', '24.706', '', ''] }, { cells: ['2', '', '', ''] }, { cells: ['3', '', '', ''] }, { cells: ['4', '', '', ''] }],
+      }],
+      _baseline: [{ id: 1, name: '表1', headers: ['序号', '电压', '备注', 'x'], rows: [{ cells: ['1', '', '', ''] }, { cells: ['2', '', '', ''] }, { cells: ['3', '', '', ''] }, { cells: ['4', '', '', ''] }] }],
+      _presets: [{ id: 1, rows: [{ cells: ['1', '', '', ''] }, { cells: ['2', '', '', ''] }, { cells: ['3', '', '', ''] }, { cells: ['4', '', '', ''] }] }],
+    };
+    const fp = fns.parseFileToPayload(JSON.stringify(edited), null, 'first.json');
+    const merge = fns.computeMerge(fp, fns.S.server);
+    eq('首次上传能识别到用户填的数据', merge.stats.add >= 1 || merge.stats.mod >= 1, true);
+    eq('没有整表跳过', merge.stats.skipped, 0);
+    const up = fns.buildUploadTables(fns.S.server, merge.mergedCell, fns.S.defs);
+    eq('上传体带 2 张表（模板补出来的也要写）', up.length, 2);
+    eq('用户填的 24.706 进了上传体', up[0].rows[0].cells[1], '24.706');
+  }
+
   console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);
   process.exit(fail ? 1 : 0);
 })();

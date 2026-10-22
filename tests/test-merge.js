@@ -262,5 +262,48 @@ console.log('\n=== 12. 表集合不一致：以服务器已存数据为准，不
   eq('上传体只有服务器认得的那 1 张表', up.map((t) => t.id), [0]);
 }
 
+console.log('\n=== 13. 表 id 错位时的回退匹配（按表名 / 按表头） ===');
+{
+  // 服务器把表重新编号了（老师增删表导致 id 变化），但表名和表头还在
+  const file = mkFile([
+    mkTable(7, ['a', 'b'], [['1', 'X']], '表1：升温记录'),
+  ], [mkTable(7, ['a', 'b'], [['1', '2']], '表1：升温记录')]);
+
+  // ① 按表名唯一匹配
+  const byName = mkServer([mkTable(1, ['a', 'b'], [['1', '2']], '表1：升温记录')]);
+  const m1 = fns.computeMerge(file, byName);
+  eq('按表名匹配成功', [m1.stats.tables, m1.stats.skipped, m1.stats.remapped], [1, 0, 1]);
+  eq('mapping 记录：7 → 1（by name）', m1.mapping.map((x) => [x.fileId, x.targetId, x.by]), [[7, 1, 'name']]);
+  const up1 = fns.buildUploadTables(byName, m1.mergedCell);
+  eq('改动写进服务器表 id=1', up1[0].rows[0].cells, ['1', 'X']);
+  eq('改动 key 用的是服务器 id', m1.changes[0].t, 1);
+
+  // ② 表名没有 → 按表头签名唯一匹配
+  const byHeaders = mkServer([mkTable(3, ['a', 'b'], [['1', '2']], '')]);
+  const fileNoName = mkFile([{ id: 7, name: '', headers: ['a', 'b'], rows: [{ cells: ['1', 'X'] }] }],
+    [{ id: 7, name: '', headers: ['a', 'b'], rows: [{ cells: ['1', '2'] }] }]);
+  const m2 = fns.computeMerge(fileNoName, byHeaders);
+  eq('按表头匹配成功', [m2.stats.tables, m2.stats.remapped], [1, 1]);
+  eq('mapping by headers', m2.mapping[0].by, 'headers');
+  const up2 = fns.buildUploadTables(byHeaders, m2.mergedCell);
+  eq('改动写进服务器表 id=3', up2[0].rows[0].cells, ['1', 'X']);
+
+  // ③ 表头签名不唯一 → 不许猜，宁可不写
+  const ambiguous = mkServer([
+    mkTable(3, ['a', 'b'], [['', '']], ''),
+    mkTable(4, ['a', 'b'], [['', '']], ''),
+  ]);
+  const m3 = fns.computeMerge(fileNoName, ambiguous);
+  eq('歧义时不匹配、整表跳过', [m3.stats.tables, m3.stats.skipped], [0, 1]);
+  eq('mapping 记录为未匹配', m3.mapping[0].targetId, null);
+
+  // ④ 完全对不上 → 跳过且给出可读原因
+  const none = mkServer([mkTable(3, ['x', 'y'], [['', '']], '别的表')]);
+  const m4 = fns.computeMerge(fileNoName, none);
+  eq('完全对不上 → skipped', m4.stats.skipped, 1);
+  ok('给出可读原因', m4.warnings.some((w) => w.includes('找不到对应表')), JSON.stringify(m4.warnings));
+  eq('没有产生任何改动', m4.changes.length, 0);
+}
+
 console.log(`\n结果：${pass} 通过 / ${fail} 失败\n`);
 process.exit(fail ? 1 : 0);
